@@ -1,0 +1,1453 @@
+---
+title: "MINT Block Evaluation - T2D Data"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+# Setup
+
+Load the local mixOmics repo - contains changes yet to be implemented in bioconductor version
+
+```{r, warning=FALSE, message=FALSE}
+# load mixOmics from local github repo
+git_repo_path = file.path("..","GitHubRepo","mixOmics")
+setwd(git_repo_path)
+library(devtools)
+load_all(".")
+```
+
+Load in other libraries
+ 
+```{r, message=FALSE}
+library(curatedMetagenomicData)
+library(SummarizedExperiment)
+library(dplyr)
+library(compositions)
+library(ggplot2)
+library(sva)
+library(limma)
+library(UpSetR)
+library(cluster)
+library(pheatmap)
+library(RColorBrewer)
+library(gridExtra)
+library(knitr)
+```
+
+Create some colour palettes
+
+```{r}
+my_Set1 <- brewer.pal(n=9, name="Set1")[-c(6)]
+my_Set3 <- brewer.pal(n=12, name="Set3")[-c(2,12)]
+my_Paired <- brewer.pal(n=12, name="Paired")[-c(11)]
+```
+
+Load functions
+
+```{r}
+# functions for benchmarking
+source("BenchmarkingFunctions.R")
+# load in tune function(s)
+function.path <- file.path("..","NewTuningFunctions","tune.mint.block.splsda.R")
+source(function.path)
+function.path <- file.path("..","NewTuningFunctions","tune.mint.block.plsda.R")
+source(function.path)
+```
+
+Output folders
+
+```{r}
+usecase_name <- 'CMD_QS'
+plot_folder <- file.path('plots', usecase_name)
+```
+
+# Data
+
+## Load and tidy
+
+Loading the pre-processed data already obtained form the CMD repository
+
+```{r}
+processed.data.path.CMD <- file.path("..","DataSources","CMD","QS_expdata_processed.rds")
+all_expdata <- readRDS(processed.data.path.CMD)
+```
+
+Prepare data for models
+
+```{r}
+# remove identified outlier?
+# sample_excl <- "HMP2_J05379_M_ST_T0_B0_0120_ZOZOW1T-44_H15WVBG"
+sample_excl <- "Nothing_To_Remove"
+
+fit_data <- list(species = t(all_expdata$species[,colnames(all_expdata$species) != sample_excl]),
+                pathways = t(all_expdata$pathways[,colnames(all_expdata$pathways) != sample_excl]))
+
+sample_metadata <- all_expdata$sample_metadata[rownames(all_expdata$sample_metadata) != sample_excl,]
+sample_metadata$study_code <- substr(sample_metadata$study_name,1,3)
+
+sample.response <- sample_metadata$response
+sample.study <- sample_metadata$study_code
+studies <- unique(sample.study)
+studies
+```
+
+Metadata
+
+```{r}
+species_metadata <- all_expdata$species_metadata
+pathways_metadata <- all_expdata$pathways_metadata
+```
+
+Tidy up names for species block
+
+```{r}
+# create new variable in metadata
+species_metadata$species_short <- substr(
+  species_metadata$species_id,
+  unlist(regexpr(":",species_metadata$species_id))+1,
+  nchar(species_metadata$species_id)
+)
+
+# adjust names
+rownames(species_metadata) <- species_metadata$species_short
+colnames(fit_data$species) <- species_metadata$species_short
+```
+
+Export metadata for interpretation later on
+
+```{r}
+saveRDS(pathways_metadata,file.path(plot_folder,'pathways_metadata.rds'))
+saveRDS(species_metadata,file.path(plot_folder,'species_metadata.rds'))
+```
+
+Check counts of observations and variables
+
+```{r}
+lapply(fit_data,function(x){dim(x)})
+```
+
+Counts by study and response
+
+```{r}
+table(sample.study, sample.response)
+```
+
+Check missing values
+
+```{r}
+mean(is.na(all_expdata$species))
+mean(is.na(all_expdata$pathways))
+```
+
+
+## Unwanted variation adjustment
+
+Specify model to be taken into account
+
+```{r}
+# specify a model based on the response that will be used
+mod <- model.matrix(~as.factor(sample.response))
+```
+
+ComBat adjusted data
+
+```{r, warning=FALSE, message=FALSE}
+fit_data.combat <- lapply(fit_data, function(x){
+   t(ComBat(t(x), batch = sample.study, mod=mod))
+})
+```
+
+RBE adjusted data
+
+```{r}
+fit_data.RBE <- lapply(fit_data, function(x){
+   t(removeBatchEffect(t(x), batch = sample.study, design=mod))
+})
+```
+
+
+## Unwanted variation in raw data
+
+Get PCs for each block
+
+```{r}
+fit.pca <- lapply(names(fit_data), function(block){
+    PCA <- mixOmics::pca(X = fit_data[[block]], ncomp = 2, center = TRUE, scale = TRUE)$variates$X
+    PCA <- as.data.frame(scale(PCA))
+    PCA$block <- block
+    PCA$Class <- as.factor(sample.response)
+    PCA$Study <- as.factor(sample.study)
+    return(PCA)
+})
+
+fit.pca <- do.call(rbind,fit.pca)
+```
+
+Plot to examine unwanted variation
+
+```{r}
+ggplot(fit.pca, aes(x = PC1, y = PC2, color = Study)) +
+  geom_point(size = 2) +
+  facet_grid(~block) +
+  theme_bw()+
+  theme(
+    panel.grid.minor=element_blank(),
+    panel.grid.major=element_blank()
+    , strip.text = element_text(size = 16)
+    , axis.title = element_text(size = 14)
+    # , axis.text = element_text(size = 14)
+    , axis.text = element_blank()
+    , axis.ticks = element_blank()
+    , legend.title = element_text(size = 14)
+    , legend.text = element_text(size = 14)
+    # ,legend.position="none"
+    ) +
+  scale_color_manual(values = my_Set1)
+
+ggsave(file.path(plot_folder,'PCA.pdf'), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'PCA.png'), width = 20, height = 10, units = "cm") 
+
+```
+
+
+# Benchmarking with all data
+
+## Choose inputs
+
+```{r}
+ncomp <- 2
+keepX <- list(species=rep(50,ncomp), pathways=rep(50,ncomp))
+# change design matrix to improve classification aspect
+design.ratio.X = 0.10
+```
+
+## Fit using all data
+
+```{r}
+fit.block.splsda.full <- block.splsda(X = fit_data, Y = sample.response, ncomp = ncomp, keepX = keepX, design = design.ratio.X)
+fit.block.splsda.combat.full <- block.splsda(X = fit_data.combat, Y = sample.response, ncomp = ncomp, keepX = keepX, design = design.ratio.X)
+fit.block.splsda.RBE.full <- block.splsda(X = fit_data.RBE, Y = sample.response, ncomp = ncomp, keepX = keepX, design = design.ratio.X)
+fit.mint.block.splsda.full <- mint.block.splsda(X = fit_data, Y = sample.response, study=sample.study, ncomp = ncomp, keepX = keepX, design = design.ratio.X)
+```
+
+## Quantitative measures of spread
+
+```{r}
+fits <- list(
+  "DIABLO" = fit.block.splsda.full,
+  "DIABLO_combat" = fit.block.splsda.combat.full,
+  "DIABLO_rbe" = fit.block.splsda.RBE.full,
+  "MINT Block" = fit.mint.block.splsda.full
+)
+```
+
+
+### R2 from linear models
+
+Extract and plot r2 values by block and model
+
+```{r}
+r2.all.fits <- extract.fit.r2(fits = fits, blocks = names(fit_data), studies = sample.study)
+
+r2.all.fits$r2_rnd <-  round(r2.all.fits$r2,2)
+print(r2.all.fits)
+
+# dot plot of r2 values by fit and block
+ggplot(r2.all.fits) + 
+  geom_point(aes(x = fit, y = r2, color = fit)
+             # , position = position_dodge(width = 0.25)
+             ) + 
+  labs(
+    # title = "GBR",
+    x = "Fit",
+    y = "R2"
+    ) +
+  facet_grid(comp~block) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor=element_blank(),
+    legend.position="none"
+    ) +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(file.path(plot_folder,'R2_study.pdf'), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'R2_study.png'), width = 20, height = 10, units = "cm") 
+```
+
+
+### Silhouette cofficients
+
+Extract average silhouette widths by fit, block and study
+
+```{r}
+sc.df <- extract.fit.sc(fits = fits, blocks = names(fit_data))
+
+# dot plot of ave_width values by fit, block, and study
+ggplot(sc.df) + 
+  geom_point(aes(x = fit, y = ave_width, color = study.name) 
+             # ,position = position_dodge(width = 0.25)
+             ) + 
+  labs(
+    x = "Fit",
+    y = "Average width"
+    ) +
+  facet_grid(~block) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor=element_blank()
+    ) +
+  scale_color_manual(values = my_Set1)
+
+ggsave(file.path(plot_folder,'silhouette_study.pdf'), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'silhouette_study.png'), width = 20, height = 10, units = "cm")
+```
+
+### ARI values based on clustering
+
+Compared to study groups
+
+```{r}
+ari.all.fits <- extract.fit.ari(fits = fits, blocks = names(fit_data), studies = sample.study)
+
+# print the table
+ari.all.fits$ari_rnd <-  round(ari.all.fits$ari,2)
+print(ari.all.fits)
+
+# dot plot of ave_width values by fit, block, and study
+ggplot(ari.all.fits) + 
+  geom_point(aes(x = fit, y = ari, color = fit)
+             # , position = position_dodge(width = 0.25), size = 3
+             ) + 
+  labs(
+    # title = "GBR",
+    x = "Fit",
+    y = "ARI"
+    ) +
+  facet_grid(~block) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor=element_blank(),
+    legend.position="none"
+    ) +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(file.path(plot_folder,'ARI_study.pdf'), width = 15, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'ARI_study.png'), width = 15, height = 10, units = "cm") 
+```
+
+
+# Benchmark using subsets
+
+## Fit models 
+
+block.splsda on raw data
+
+```{r}
+fit.block.splsda <- sapply(studies, function(x){
+  InTrain <- !is.element(sample.study,x)
+  Y.train <- sample.response[InTrain]
+  fit_data.train <- lapply(fit_data, function(y){y[InTrain,]})
+  fit <- block.splsda(X = fit_data.train, Y = Y.train, ncomp = ncomp, keepX = keepX, design = design.ratio.X)
+}, simplify = FALSE, USE.NAMES = TRUE)
+```
+
+block.splsda on combat adjusted data - combat applied to each subset independently
+
+```{r, message=FALSE}
+fit.block.splsda.combat <- sapply(studies, function(x){
+  InTrain <- !is.element(sample.study,x)
+  Y.train <- sample.response[InTrain]
+  fit_data.train = lapply(fit_data, function(y){
+      t(ComBat(t(y[InTrain,]), batch = sample.study[InTrain], mod = model.matrix(~as.factor(Y.train))))
+      })
+  fit <- block.splsda(X = fit_data.train, Y = Y.train, ncomp = ncomp, keepX = keepX, design = design.ratio.X)
+}, simplify = FALSE, USE.NAMES = TRUE)
+```
+
+block.splsda on RBE adjusted data - RDE applied to each subset independently
+
+```{r, message=FALSE}
+fit.block.splsda.RBE <- sapply(studies, function(x){
+  InTrain <- !is.element(sample.study,x)
+  Y.train <- sample.response[InTrain]
+  fit_data.train <- lapply(fit_data, function(y){
+      t(removeBatchEffect(t(y[InTrain,]), batch = sample.study[InTrain], design = model.matrix(~as.factor(Y.train))))
+      })
+  fit <- block.splsda(X = fit_data.train, Y = Y.train, ncomp = ncomp, keepX = keepX, design = design.ratio.X)
+}, simplify = FALSE, USE.NAMES = TRUE)
+```
+
+mint.block.splsda fit
+
+```{r}
+fit.mint.block.splsda <- sapply(studies, function(x){
+  InTrain <- !is.element(sample.study,x)
+  Y.train <- sample.response[InTrain]
+  fit_data.train <- lapply(fit_data, function(y){y[InTrain,]})
+  sample.study.train <- sample.study[InTrain]
+  fit <- mint.block.splsda(X = fit_data.train, Y = Y.train, study = sample.study.train, ncomp = ncomp, keepX = keepX, design = design.ratio.X)
+}, simplify = FALSE, USE.NAMES = TRUE)
+```
+
+## Extract features and compare stability across subsets
+
+Extract and plot for all fits
+
+```{r}
+fits <- list(
+  "DIABLO" = fit.block.splsda,
+  "DIABLO_combat" = fit.block.splsda.combat,
+  "DIABLO_rbe" = fit.block.splsda.RBE,
+  "MINT Block" = fit.mint.block.splsda
+)
+
+#####
+# stability using all components
+####
+
+selection_frequency_th <- length(fits[[1]]) * (1/2)
+# features selected in > selection_frequency_th studies put in the 'more' group
+
+fit.feature.props <- extract.fit.feature.props(
+  fits = fits, 
+  blocks = names(fit_data), 
+  selection_frequency_th = selection_frequency_th,
+  begin_comp = 1,
+  end_comp = ncomp
+  )
+
+# plot the feature selection proportions by fit and block and frequency
+ggplot(fit.feature.props) + 
+  geom_col(aes(x = selection_frequency, y = proportion_of_features, fill = fit), position = 'dodge') + 
+  labs(
+    x = "Selection frequency",
+    y = "Proportion of variables"
+    ) +
+  facet_grid(~block) +
+  theme_bw() +
+  theme(
+    # axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor=element_blank()
+    ) +
+  scale_fill_brewer(palette = "Set2")+
+  labs(fill = "Fit")
+
+ggsave(file.path(plot_folder,'stability_all.pdf'), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'stability_all.png'), width = 20, height = 10, units = "cm") 
+
+# print proportion of features selected across all fits
+
+print(
+  fit.feature.props[fit.feature.props$selection_frequency==max(fit.feature.props$selection_frequency),]
+)
+
+# print proportions by frequency group
+
+fit.feature.props.group <- fit.feature.props %>%
+  group_by(block, fit, selection_frequency_group) %>%
+  summarise(proportion = sum(proportion_of_features)) %>%
+  as.data.frame()
+fit.feature.props.group$proportion <- round(fit.feature.props.group$proportion,2)
+
+print(fit.feature.props.group)
+
+# print weighted stability score by block and model
+
+fit.feature.props.global <- fit.feature.props %>%
+  group_by(block, fit) %>%
+  summarise(ave_freq = sum(wghtd_freq)) %>%
+  as.data.frame()
+fit.feature.props.global$stability <- round(fit.feature.props.global$ave_freq / length(studies),2)
+fit.feature.props.global$ave_freq <- round(fit.feature.props.global$ave_freq,2)
+
+print(fit.feature.props.global)
+
+```
+
+## Make predictions for held out studies
+
+predict using block.splsda model
+
+```{r}
+pred.block.splsda <- sapply(studies, function(x){
+  InTest <- is.element(sample.study,x)
+  pred_data.test <- lapply(fit_data, function(y){y[InTest,]})
+  pred <- predict(object = fit.block.splsda[[x]], newdata = pred_data.test)
+  Y.test <- sample.response[InTest]
+  pred.actual <- list(
+    pred = pred,
+    Y.test = Y.test
+  )
+}, simplify = FALSE, USE.NAMES = TRUE)
+```
+
+predict using block.splsda.combat model
+
+```{r}
+pred.block.splsda.combat <- sapply(studies, function(x){
+  InTest <- is.element(sample.study,x)
+  pred_data.test <- lapply(fit_data, function(y){y[InTest,]})
+  pred <- predict(object = fit.block.splsda.combat[[x]], newdata = pred_data.test)
+  Y.test <- sample.response[InTest]
+  pred.actual <- list(
+    pred = pred,
+    Y.test = Y.test
+  )
+}, simplify = FALSE, USE.NAMES = TRUE)
+```
+
+predict using block.splsda.RBE model
+
+```{r}
+pred.block.splsda.RBE <- sapply(studies, function(x){
+  InTest <- is.element(sample.study,x)
+  pred_data.test <- lapply(fit_data, function(y){y[InTest,]})
+  pred <- predict(object = fit.block.splsda.RBE[[x]], newdata = pred_data.test)
+  Y.test <- sample.response[InTest]
+  pred.actual <- list(
+    pred = pred,
+    Y.test = Y.test
+  )
+}, simplify = FALSE, USE.NAMES = TRUE)
+```
+
+predict using mint.block.splsda model
+
+```{r}
+pred.mint.block.splsda <- sapply(studies, function(x){
+  InTest <- is.element(sample.study,x)
+  pred_data.test <- lapply(fit_data, function(y){y[InTest,]})
+  sample.study.test <- sample.study[InTest]
+  pred <- predict(object = fit.mint.block.splsda[[x]], newdata = pred_data.test, study.test = sample.study.test)
+  Y.test <- sample.response[InTest]
+  pred.actual <- list(
+    pred = pred,
+    Y.test = Y.test
+  )
+}, simplify = FALSE, USE.NAMES = TRUE)
+```
+
+## Compare predictions
+
+Choose which metrics to use
+
+```{r}
+prediction.distance <- c("max.dist", "centroids.dist", "mahalanobis.dist")[1]
+prediction.type <- c("AveragedPredict.class", "WeightedPredict.class", "MajorityVote", "WeightedVote")[4]
+error.type <- c("BER","ER")[1]
+```
+
+Extract predictions and actuals
+
+```{r}
+predictions <- list(
+  "DIABLO" = pred.block.splsda,
+  "DIABLO_combat" = pred.block.splsda.combat,
+  "DIABLO_rbe" = pred.block.splsda.RBE,
+  "MINT Block" = pred.mint.block.splsda
+)
+
+classifications.all.models <- extract.classifications(
+  predictions = predictions,
+  pred.method = prediction.type,
+  pred.distance = prediction.distance
+  )
+
+classifications.all.models$IfError <- !classifications.all.models$IfCorrect
+
+```
+
+Calculate error
+
+```{r, message=FALSE}
+
+# BER by model and study
+classifications.BER.study <- classifications.all.models %>%
+  group_by(model.name, study.name, study.actuals) %>%
+  summarize(
+    ErrorRate = round(mean(IfError),2)
+    ) %>%
+  as.data.frame() %>%
+  group_by(model.name, study.name) %>%
+  summarize(
+    BER = round(mean(ErrorRate),2)
+    ) %>%
+  as.data.frame()
+classifications.BER.study
+
+# balanced error rate
+classifications.BER <- classifications.all.models %>%
+  group_by(model.name, study.name, study.actuals) %>%
+  summarize(
+    ErrorRate = mean(IfError)
+    ) %>%
+  as.data.frame() %>%
+  group_by(model.name, study.name) %>%
+  summarize(
+    BER = mean(ErrorRate)
+    ) %>%
+  as.data.frame() %>%
+  group_by(model.name) %>%
+  summarize(
+    BER.mean = round(mean(BER),2),
+    BER.sd = sd(BER),
+    # BER.n = n(),
+    BER.se = round(sd(BER)/sqrt(n()),3)
+    ) %>%
+  # mutate(BER.se = round(BER.sd/sqrt(BER.n),3)) %>%
+  as.data.frame()
+classifications.BER
+  
+```
+
+Plot the average BER by fit
+
+```{r}
+classifications.BER$lower <- classifications.BER$BER.mean - 2*classifications.BER$BER.se
+classifications.BER$upper <- classifications.BER$BER.mean + 2*classifications.BER$BER.se
+
+ggplot(classifications.BER) + 
+  geom_point(aes(x = model.name, y = BER.mean, colour = model.name)) + 
+  # geom_col(aes(x = model.name, y = BER.mean, fill = model.name)) + 
+  geom_errorbar(aes(x = model.name, ymin = lower, ymax = upper
+                    , colour = model.name
+                    )
+                ) +
+  labs(
+    x = "Fit",
+    y = "BER"
+    ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank(),
+    legend.position="none"
+    ) +
+  scale_colour_brewer(palette = "Dark2") +
+  scale_fill_brewer(palette = "Dark2")
+
+ggsave(file.path(plot_folder,'BER.pdf'), width = 10, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'BER.png'), width = 10, height = 10, units = "cm") 
+```
+
+
+# In depth analysis with MINT Block
+
+## Tune number of components
+
+Parameters
+
+```{r}
+ncomp = 7
+```
+
+Using the new tuning function
+
+```{r}
+tuned.mint.block.plsda <- tune.mint.block.plsda(
+  X = fit_data,
+  Y = sample.response,
+  study = sample.study,
+  ncomp = ncomp,
+  design = design.ratio.X
+)
+```
+
+Plot errors for new tuning function
+
+```{r}
+plotdf <- tuned.mint.block.plsda$loocv.ncomp$errors.global$BER
+# line graph from plotdf with ncomp on the x axis and error rate on the y axis
+# with a different line for each prediction method
+ggplot(plotdf, aes(x = ncomp, y = mean, color = prediction.method)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    # title = "CMD",
+       x = "Number of components",
+       y = "BER") +
+  theme_bw()+
+  theme(
+    # panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank()
+    ) +
+  scale_color_brewer(palette = "Paired")
+
+ggsave(file.path(plot_folder,'ncomp.pdf'), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'ncomp.png'), width = 20, height = 10, units = "cm")  
+```
+
+
+Method that gave min overall but with error bars
+
+```{r}
+plotdf <- tuned.mint.block.plsda$loocv.ncomp$errors.global$BER
+best.prediction.method <- unique(plotdf$prediction.method[plotdf$mean==min(plotdf$mean)])[1]
+plotdf <- plotdf[
+  is.element(plotdf$prediction.method,best.prediction.method),
+  ]
+# line graph from plotdf with ncomp on the x axis and error rate on the y axis
+# with a different line for each prediction method
+ggplot(plotdf, aes(x = ncomp, y = mean, color = prediction.method)) +
+  geom_line() +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se)) +
+  labs(
+    # title = "GBR",
+       x = "Number of components",
+       y = "BER") +
+  theme_bw()+
+  theme(
+    # panel.grid.major=element_blank(),
+    panel.grid.minor=element_blank()
+    ) +
+  scale_color_brewer(palette = "Paired")
+```
+
+
+By study 
+
+```{r}
+plotdf <- tuned.mint.block.plsda$loocv.ncomp$errors.study$BER
+plotdf$Study <- as.factor(plotdf$study.name)
+plotdf <- plotdf[
+  is.element(plotdf$prediction.method,best.prediction.method),
+  ]
+# line graph from plotdf with ncomp on the x axis and error rate on the y axis
+ggplot(plotdf, aes(x = ncomp, y = error, color = Study)) +
+  geom_point() +
+  stat_summary(geom="line", fun = "mean", color="black", linetype="dashed") +
+  stat_summary(geom="point", fun = "mean", color="black") +
+  theme_bw()+
+  theme(
+    panel.grid.minor=element_blank()
+    ) +
+  labs(title = "Errors by number of components",
+       x = "Number of components",
+       y = "BER") +
+  scale_color_manual(values = my_Set1)
+
+ggsave(file.path(plot_folder,'ncomp_study.pdf'), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'ncomp_study.png'), width = 20, height = 10, units = "cm") 
+```
+
+
+## Tune number of variables
+
+What combo gives best overall error?
+
+```{r}
+ncomp <- 2
+test.keepX = list(species = c(25,50,75), pathways = c(25,50,75))
+
+tuned.mint.block.splsda.global = tune.mint.block.splsda(
+  X = fit_data,
+  Y = sample.response,
+  study = sample.study,
+  ncomp = ncomp,
+  test.keepX = test.keepX,
+  design = design.ratio.X,
+  prediction.distance = prediction.distance,
+  prediction.type = prediction.type,
+  error.type = error.type,
+  use.ttest = FALSE
+)
+
+# export results as the tuning is time consuming
+saveRDS(tuned.mint.block.splsda.global,file.path(plot_folder,'tuned.mint.block.splsda.global.rds'))
+
+# import saved tuning results
+tuned.mint.block.splsda.global <- readRDS(file.path(plot_folder,'tuned.mint.block.splsda.global.rds'))
+```
+
+
+Display results
+
+```{r}
+print(tuned.mint.block.splsda.global$loocv.variable.selection$choice.keepX)
+
+comp.to.plot = 1
+plotdf = tuned.mint.block.splsda.global$loocv.variable.selection$loocv.global.comp[[paste0("comp",comp.to.plot)]]
+ggplot(plotdf, aes(x = species, y = pathways, fill= loocv.error)) + 
+  geom_tile()
+ggsave(file.path(plot_folder,'nvar_comp1.pdf'), width = 20, height = 20, units = "cm") 
+ggsave(file.path(plot_folder,'nvar_comp1.png'), width = 20, height = 20, units = "cm") 
+
+```
+
+
+## Refit the model
+
+```{r}
+ncomp <- 2
+keepX <- list(species=c(50,75), pathways=c(25,75))
+fit.mint.block.splsda.full <- mint.block.splsda(X = fit_data, Y = sample.response, study=sample.study, ncomp = ncomp, keepX = keepX, design = design.ratio.X)
+```
+
+
+## Plots
+
+### plotDiablo
+
+```{r}
+for (comp in 1:ncomp){
+  png(file.path(plot_folder,paste0('plotDiablo_comp',comp,'.png')))
+  plotDiablo(fit.mint.block.splsda.full, ncomp = comp)
+  dev.off()
+  pdf(file.path(plot_folder,paste0('plotDiablo_comp',comp,'.pdf')))
+  plotDiablo(fit.mint.block.splsda.full, ncomp = comp)
+  dev.off()
+}
+
+knitr::include_graphics(file.path(plot_folder,'plotDiablo_comp1.png'))
+knitr::include_graphics(file.path(plot_folder,'plotDiablo_comp2.png'))
+```
+
+
+### Plot global variates
+
+```{r}
+# create long format data frame
+
+variates.global <- sapply(names(fit.mint.block.splsda.full$variates), function(block){
+  block.variates <- as.data.frame(fit.mint.block.splsda.full$variates[[block]])
+  block.variates$block <- block
+  block.variates$Batch <- fit.mint.block.splsda.full$study
+  block.variates$Study <- fit.mint.block.splsda.full$study
+  block.variates$Class <- fit.mint.block.splsda.full$Y
+  return(block.variates)
+},simplify = FALSE,USE.NAMES = TRUE)
+
+variates.global <- do.call('rbind',variates.global)
+
+# remove Y variates?
+
+variates.global <- variates.global[variates.global$block!="Y",]
+
+# plot the component values
+
+ggplot(variates.global, aes(x = comp1, y = comp2, color = Study)) +
+  geom_point(size = 2) +
+  facet_grid(~block) +
+  theme_bw()+
+  theme(
+    panel.grid.minor=element_blank(),
+    panel.grid.major=element_blank()
+    , strip.text = element_text(size = 16)
+    , axis.title = element_text(size = 14)
+    # , axis.text = element_text(size = 14)
+    , axis.text = element_blank()
+    , axis.ticks = element_blank()
+    , legend.title = element_text(size = 14)
+    , legend.text = element_text(size = 14)
+    # ,legend.position="none"
+    ) +
+  # scale_color_brewer(palette = "Dark2")
+  scale_color_manual(values = my_Set1)
+
+ggsave(file.path(plot_folder,"variates_global_comp12_all.pdf"), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'variates_global_comp12_all.png'), width = 20, height = 10, units = "cm") 
+```
+
+
+
+### Plot partial variates by component by study
+
+```{r}
+# put into easier format
+variates.partials <- sapply(1:ncomp, function(comp){
+  block.partials <- lapply(fit.mint.block.splsda.full$variates.partial, function(block){
+    study.partials <- lapply(block, function(study){
+      study[,comp, drop=FALSE]
+    })
+    do.call("rbind",study.partials)
+  })
+  comp.partials <- do.call("cbind",block.partials)
+  colnames(comp.partials) = names(fit.mint.block.splsda.full$variates.partial)
+  comp.partials <- comp.partials[fit.mint.block.splsda.full$names$sample,]
+  comp.partials <- as.data.frame(comp.partials)
+  comp.partials$Status <- fit.mint.block.splsda.full$Y
+  comp.partials$Study <- fit.mint.block.splsda.full$study
+  return(comp.partials)
+},simplify = FALSE,USE.NAMES = TRUE)
+
+# plot for component 1
+ggplot(variates.partials[[1]], aes(x = species, y = pathways, color = Status)) +
+  geom_point(size = 0.9) +
+  facet_wrap(~Study) +
+  theme_bw()+
+  theme(
+    panel.grid.minor=element_blank(),
+    panel.grid.major=element_blank()
+    ,legend.position="bottom"
+    ) +
+  scale_color_manual(values = brewer.pal(5, "Set1")[c(2,5)])
+ggsave(filename = file.path(plot_folder,"variates_partials_comp1.pdf"), 
+       width = 15, height = 15, units = "cm")
+ggsave(filename = file.path(plot_folder,"variates_partials_comp1.png"), 
+       width = 15, height = 15, units = "cm")
+
+# plot for component 2
+ggplot(variates.partials[[2]], aes(x = species, y = pathways, color = Status)) +
+  geom_point(size = 0.9) +
+  facet_wrap(~Study) +
+  theme_bw()+
+  theme(
+    panel.grid.minor=element_blank(),
+    panel.grid.major=element_blank()
+    ,legend.position="bottom"
+    ) +
+  scale_color_manual(values = brewer.pal(5, "Set1")[c(2,5)])
+ggsave(filename = file.path(plot_folder,"variates_partials_comp2.pdf"), 
+       width = 15, height = 15, units = "cm")
+ggsave(filename = file.path(plot_folder,"variates_partials_comp2.png"), 
+       width = 15, height = 15, units = "cm")
+
+
+
+```
+
+
+### plotVar
+
+```{r}
+png(file.path(plot_folder,'plotVar.png'))
+plotVar(fit.mint.block.splsda.full,
+        var.names = FALSE, style = 'graphics', legend = TRUE,
+        pch = c(16, 17), cex = c(1,1),
+        col = my_Paired[c(11,10)])
+dev.off()
+
+pdf(file.path(plot_folder,'plotVar.pdf'))
+plotVar(fit.mint.block.splsda.full,
+        var.names = FALSE, style = 'graphics', legend = TRUE,
+        pch = c(16, 17), cex = c(1,1),
+        col = my_Paired[c(11,10)])
+dev.off()
+
+knitr::include_graphics(file.path(plot_folder,'plotVar.png'))
+```
+
+### circosPlot
+
+```{r}
+for (comp in 1:ncomp){
+  
+  png(file.path(plot_folder,paste0('circosPlot_comp',comp,'.png')))
+  circosPlot(fit.mint.block.splsda.full,
+           comp = comp,
+           cutoff = 0.3, line = TRUE,
+           color.blocks = my_Paired[c(11,10)],
+           color.cor = brewer.pal(n = 4,name = "Set1")[c(1,2)],
+           size.labels = 1.5
+           # ,line = TRUE
+           # ADDING A LINE ARGUMENT CAUSES AN ERROR
+           )
+  dev.off()
+  
+  pdf(file.path(plot_folder,paste0('circosPlot_comp',comp,'.pdf')))
+  circosPlot(fit.mint.block.splsda.full,
+           comp = comp,
+           cutoff = 0.3, line = TRUE,
+           color.blocks = my_Paired[c(11,10)],
+           color.cor = brewer.pal(n = 4,name = "Set1")[c(1,2)],
+           size.labels = 1.5
+           # ,line = TRUE
+           )
+  dev.off()
+  
+}
+
+knitr::include_graphics(file.path(plot_folder,'circosPlot_comp1.png'))
+knitr::include_graphics(file.path(plot_folder,'circosPlot_comp2.png'))
+
+```
+
+
+### Plot global loadings
+
+```{r}
+ndisplay <- 25
+for (comp in 1:ncomp){
+  for (block in names(fit_data)){
+    
+    png(file.path(plot_folder, paste0('plotLoadings_',block,comp,'.png')))
+    plotLoadings(
+      fit.mint.block.splsda.full 
+      ,comp = comp 
+      ,contrib = 'max' 
+      ,method = 'median'
+      ,block = block
+      ,ndisplay = ndisplay
+      ,size.title = 0.001
+      # ,legend = FALSE
+      ,size.name = 0.50
+      )
+    dev.off()
+    pdf(file.path(plot_folder, paste0('plotLoadings_',block,comp,'.pdf')))
+    plotLoadings(
+      fit.mint.block.splsda.full 
+      ,comp = comp 
+      ,contrib = 'max' 
+      ,method = 'median'
+      ,block = block
+      ,ndisplay = ndisplay
+      ,size.title = 0.001
+      # ,legend = FALSE
+      ,size.name = 0.50
+      )
+    dev.off()
+  }
+}
+
+knitr::include_graphics(file.path(plot_folder,paste0('plotLoadings_',names(fit_data)[1], 1,'.png')))
+knitr::include_graphics(file.path(plot_folder,paste0('plotLoadings_',names(fit_data)[1], 2,'.png')))
+
+knitr::include_graphics(file.path(plot_folder,paste0('plotLoadings_',names(fit_data)[2], 1,'.png')))
+knitr::include_graphics(file.path(plot_folder,paste0('plotLoadings_',names(fit_data)[2], 2,'.png')))
+```
+
+### Heatmaps for selected features
+
+```{r}
+# check name alignment
+mean(colnames(fit.mint.block.splsda.full$X$species)==rownames(species_metadata))
+mean(rownames(fit.mint.block.splsda.full$loadings$species)==rownames(species_metadata))
+mean(colnames(fit.mint.block.splsda.full$X$pathways)==rownames(pathways_metadata))
+mean(rownames(fit.mint.block.splsda.full$loadings$pathways)==rownames(pathways_metadata))
+# add in loading values
+species_metadata <- cbind(species_metadata,fit.mint.block.splsda.full$loadings$species)
+pathways_metadata <- cbind(pathways_metadata,fit.mint.block.splsda.full$loadings$pathways)
+# export meta data
+species_metadata_comps <- species_metadata[species_metadata$comp1!=0 | species_metadata$comp2!=0,]
+pathways_metadata_comps <- pathways_metadata[pathways_metadata$comp1!=0 | pathways_metadata$comp2!=0,]
+# save metadata as a csv
+write.csv(x = species_metadata_comps,
+          file = file.path(plot_folder,"species_metadata_comps.csv"),
+          quote=FALSE, row.names = FALSE)
+write.csv(x = pathways_metadata_comps,
+          file = file.path(plot_folder,"pathways_metadata_comps.csv"),
+          quote=FALSE, row.names = FALSE)
+```
+
+create heatmap data for each component using a loop
+
+```{r}
+ndisplay <- 25
+species_select_comp <- vector("list")
+pathways_select_comp <- vector("list")
+X_select_comp <- vector("list")
+annot_colors_comp <- vector("list")
+samples_annotation_comp <- vector("list")
+samples_gaps_comp <- vector("list")
+features_annotation_comp <- vector("list")
+features_gaps_comp <- vector("list")
+
+for (comp_to_plot in 1:ncomp){
+  
+  # select features form each block
+  species_rank <- rank(-abs(fit.mint.block.splsda.full$loadings$species[,comp_to_plot]))
+  # species_select <- fit.mint.block.splsda.full$loadings$species[,comp_to_plot]!=0
+  species_select <- (fit.mint.block.splsda.full$loadings$species[,comp_to_plot]!=0) & (species_rank <= ndisplay)
+  
+  pathways_rank <- rank(-abs(fit.mint.block.splsda.full$loadings$pathways[,comp_to_plot]))
+  # pathways_select <- fit.mint.block.splsda.full$loadings$pathways[,comp_to_plot]!=0
+  pathways_select <- (fit.mint.block.splsda.full$loadings$pathways[,comp_to_plot]!=0) & (pathways_rank <= ndisplay)
+  
+  # loadings to select
+  species_loadings_select <- fit.mint.block.splsda.full$loadings$species[species_select,comp_to_plot]
+  pathways_loadings_select <- fit.mint.block.splsda.full$loadings$pathways[pathways_select,comp_to_plot]
+  loadings_select <- c(species_loadings_select, pathways_loadings_select)
+  
+  # observed data (scaled by study)
+  X_select <- cbind(
+    fit.mint.block.splsda.full$X$species[,species_select],
+    fit.mint.block.splsda.full$X$pathways[,pathways_select]
+  )
+  
+  # annotate features
+  features_annotation <- data.frame(
+    Block = as.factor(c(
+      rep('species',sum(species_select)),
+      rep('pathways',sum(pathways_select))
+    )),
+    # Type = as.factor( c(
+    #   species_metadata$superkingdom[species_select],
+    #   rep('N/A',sum(pathways_select))
+    # )),
+    Phylum = as.factor( c(
+      species_metadata$phylum[species_select],
+      rep('N/A',sum(pathways_select))
+    ))
+  )
+  
+  rownames(features_annotation) <- colnames(X_select)
+  
+  # reorder features based on block and loading
+  feature_order <- order(features_annotation$Block, loadings_select)
+  features_annotation <- features_annotation[feature_order,]
+  X_select <- X_select[,feature_order]
+  mean(colnames(X_select)==rownames(features_annotation))
+  
+  # set the cut points based on the grouping
+  features_gaps <- integer()
+  for (i in 2:length(features_annotation$Block)){
+    if(features_annotation$Block[i]!=features_annotation$Block[i-1]){
+      features_gaps <- c(features_gaps,i)
+    }
+  }
+  
+  # annotate samples
+  samples_annotation <- data.frame(
+    Batch = fit.mint.block.splsda.full$study,
+    Status = fit.mint.block.splsda.full$Y
+  )
+  rownames(samples_annotation) <- rownames(X_select)
+  sample_order <- order(samples_annotation$Status, samples_annotation$Batch)
+  
+  # reorder the samples based on grouping
+  samples_annotation <- samples_annotation[sample_order,]
+  X_select <- X_select[sample_order,]
+  mean(rownames(X_select)==rownames(samples_annotation))
+  # set the cut points based on the grouping
+  samples_gaps <- integer()
+  for (i in 2:length(samples_annotation$Status)){
+    if(samples_annotation$Status[i]!=samples_annotation$Status[i-1]){
+      samples_gaps <- c(samples_gaps,i)
+    }
+  }
+  
+  # set colours for annotations
+  annot_colors <- list(
+    Block = my_Paired[c(10,11)],
+    # Type  = my_Set3[1:nlevels(features_annotation$Type)],
+    Phylum  = my_Paired[1:nlevels(features_annotation$Phylum)],
+    Batch = my_Set1[1:nlevels(samples_annotation$Batch)], 
+    Status = brewer.pal(5, "Set1")[c(2,5)]
+    )
+  
+  names(annot_colors$Block) <- levels(features_annotation$Block)
+  # names(annot_colors$Type) <- levels(features_annotation$Type)
+  names(annot_colors$Phylum) <- levels(features_annotation$Phylum)
+  names(annot_colors$Batch) <- levels(samples_annotation$Batch)
+  names(annot_colors$Status) <- levels(samples_annotation$Status)
+  
+  # save for the component
+  species_select_comp[[comp_to_plot]] <- species_select
+  pathways_select_comp[[comp_to_plot]] <- pathways_select
+  X_select_comp[[comp_to_plot]] <- X_select
+  annot_colors_comp[[comp_to_plot]] <- annot_colors
+  samples_annotation_comp[[comp_to_plot]] <- samples_annotation
+  samples_gaps_comp[[comp_to_plot]] <- samples_gaps
+  features_annotation_comp[[comp_to_plot]] <- features_annotation
+  features_gaps_comp[[comp_to_plot]] <- features_gaps
+  
+}
+```
+
+plot heatmap(s)
+
+```{r}
+for (comp_to_plot in 1:ncomp){
+  hm = pheatmap(
+    mat = X_select_comp[[comp_to_plot]],
+    # scale = "column",
+    border_color = NA,
+    cluster_rows = FALSE,
+    cluster_cols = TRUE,
+    show_rownames = FALSE,
+    show_colnames = FALSE,
+    angle_col = "90",
+    treeheight_row = 0,
+    treeheight_col = 0,
+    annotation_colors = annot_colors_comp[[comp_to_plot]],
+    annotation_row = samples_annotation_comp[[comp_to_plot]],
+    gaps_row = samples_gaps_comp[[comp_to_plot]]-1,
+    annotation_col = features_annotation_comp[[comp_to_plot]]
+    # ,
+    # gaps_col = features_gaps_comp[[comp_to_plot]] - 1
+  )
+
+ggsave(filename = file.path(plot_folder,paste0("heatmap_comp",comp_to_plot,".pdf")), 
+       plot = hm[[4]],
+       width = 15, height = 15, units = "cm")
+ggsave(filename = file.path(plot_folder,paste0("heatmap_comp",comp_to_plot,".png")), 
+       plot = hm[[4]],
+       width = 15, height = 15, units = "cm")
+}
+
+```
+
+### Check over-representation of taxa
+
+```{r}
+for (grouping_to_test in c('phylum','family','order')){
+  for (comp_to_plot in 1:ncomp){
+
+    species_metadata[,"incl"]<-species_select_comp[[comp_to_plot]]
+
+    OR.test.df <- data.frame(
+      group = species_metadata[,grouping_to_test],
+      incl = species_metadata[,"incl"]
+    )
+
+    OR.rates <- OR.test.df %>%
+      group_by(group) %>%
+      summarise(incl_rate = mean(incl)) %>%
+      as.data.frame()
+
+    OR.rates$total_rate <- mean(OR.test.df$incl)
+
+    OR.rates <- OR.rates[order(-OR.rates$incl_rate),]
+    GroupsToTest <- OR.rates$group[c(1:min(3,length(OR.rates$group)))]
+    RatesToTest <- OR.rates$incl_rate[c(1:min(3,length(OR.rates$group)))]
+
+    # loop through groups to check OR and adjust the pvalue for multiple testing
+
+    incl <- as.character(OR.test.df$incl)
+    incl[incl=="TRUE"] <- "in"
+    incl[incl=="FALSE"] <- "out"
+    incl <- as.factor(incl)
+    fisher_tests <- vector("list")
+    Groups_pvalues <- numeric()
+
+    for (g in GroupsToTest){
+      group <- OR.test.df$group
+      group[group!=g] <- "z_other"
+      group <- as.factor(group)
+      test_result <- fisher.test(x = group, y = incl, alternative = "greater", 
+                                 simulate.p.value = TRUE, B = 10000)
+      fisher_tests[[g]] <- test_result
+      pvalue <- test_result$p.value
+      Groups_pvalues <- c(Groups_pvalues,pvalue)
+    }
+
+    OR.tests <- data.frame(
+      Group = GroupsToTest,
+      Rate = round(RatesToTest,3),
+      PValue = round(Groups_pvalues,3),
+      AdjPValue = round(p.adjust(Groups_pvalues, method = "BH"),3)
+    )
+
+    print(paste0("Component: ", comp_to_plot))
+    print(paste0("Group: ", grouping_to_test))
+    print(OR.tests)
+
+  }
+}
+```
+
+
+### Plot correlations
+
+Use the network function to get all correlations
+
+```{r}
+# network function with no cutoff to get the correlation matrix and all edges
+fit.network.all <- network(fit.mint.block.splsda.full,
+        blocks = c(1,2),
+        cutoff = 0,
+        color.node = my_Paired[c(10,11)]
+        ,
+        save = 'png', name.save = file.path(plot_folder,'diablo-network-all')
+        )
+
+```
+
+Extract the correlation matrix and plot with a heatmap
+
+```{r}
+for (comp_to_plot in 1:ncomp){
+  
+  cor_Mat <- fit.network.all$M_species_pathways
+  #remove rownames suffix
+  rownames(cor_Mat) <- substr(rownames(cor_Mat),1,nchar(rownames(cor_Mat))-8)
+  colnames(cor_Mat) <- substr(colnames(cor_Mat),1,nchar(colnames(cor_Mat))-9)
+  # filter to include those for the component
+  cor_Mat <- cor_Mat[is.element(rownames(cor_Mat),names(species_select_comp[[comp_to_plot]])[species_select_comp[[comp_to_plot]]]),]
+  cor_Mat <- cor_Mat[,is.element(colnames(cor_Mat),names(pathways_select_comp[[comp_to_plot]])[pathways_select_comp[[comp_to_plot]]])]
+  
+  # get metadata
+  species_metadata_cor_Mat <- species_metadata[rownames(cor_Mat),]
+  pathways_metadata_cor_Mat <- pathways_metadata[colnames(cor_Mat),]
+  
+  # set annotation colours for the plot
+  species_annotation <- data.frame(
+      Phylum = as.factor(species_metadata_cor_Mat$phylum)
+    )
+  rownames(species_annotation) <- rownames(cor_Mat)
+  
+  annot_colors <- list(
+    Phylum  = my_Paired[1:nlevels(species_annotation$Phylum)]
+    )
+  
+  names(annot_colors$Phylum) <- levels(species_annotation$Phylum)
+  
+  # plot
+    
+  hm_cor <- pheatmap(
+      mat = t(cor_Mat),
+      # scale = "none",
+      border_color = NA,
+      cellwidth = 15,
+      cellheight = 15,
+      angle_col = 45,
+      cluster_rows = TRUE,
+      cluster_cols = TRUE,
+      show_rownames = TRUE,
+      show_colnames = TRUE,
+      treeheight_row = 0,
+      treeheight_col = 0,
+      annotation_colors = annot_colors,
+      annotation_col = species_annotation
+    )
+  
+  ggsave(filename = file.path(plot_folder,paste0("heatmap_cor_comp",comp_to_plot,".pdf")), 
+         plot = hm_cor[[4]],
+         width = 50, height = 25, units = "cm")
+  ggsave(filename = file.path(plot_folder,paste0("heatmap_cor_comp",comp_to_plot,".png")), 
+         plot = hm_cor[[4]],
+         width = 50, height = 25, units = "cm")
+
+}
+```
+
+
+### Boxplots for selected features
+
+
+```{r}
+ndisplay <- 10
+X_species_select_comp <- vector("list")
+X_pathways_select_comp <- vector("list")
+X_select_comp <- vector("list")
+
+for (comp_to_plot in 1:ncomp){
+
+  # select features form each block
+  species_rank <- rank(-abs(fit.mint.block.splsda.full$loadings$species[,comp_to_plot]))
+  species_select <- (fit.mint.block.splsda.full$loadings$species[,comp_to_plot]!=0) & (species_rank <= ndisplay)
+  pathways_rank <- rank(-abs(fit.mint.block.splsda.full$loadings$pathways[,comp_to_plot]))
+  pathways_select <- (fit.mint.block.splsda.full$loadings$pathways[,comp_to_plot]!=0) & (pathways_rank <= ndisplay)
+
+  # sample annotation
+  samples_annotation <- data.frame(
+    Sample_id = rownames(fit.mint.block.splsda.full$X$species),
+    Batch = fit.mint.block.splsda.full$study,
+    Status = fit.mint.block.splsda.full$Y
+  )
+
+  # observed data (scaled by study)
+  X_species_select <- as.data.frame(fit.mint.block.splsda.full$X$species[,species_select])
+  X_pathways_select <- as.data.frame(fit.mint.block.splsda.full$X$pathways[,pathways_select])
+
+  # merge observed data with sample annoations
+  X_species_select <- cbind(samples_annotation,  X_species_select)
+  X_pathways_select <- cbind(samples_annotation,  X_pathways_select)
+
+  #reshape to long format
+  X_species_select <- reshape(
+    data = X_species_select,
+    direction = "long",
+    idvar = c("Sample_id", "Batch", "Status"),
+    varying = list(colnames(X_species_select)[-c(1:3)]),
+    v.names = "Value",
+    timevar = "Feature",
+    times = colnames(X_species_select)[-c(1:3)]
+  )
+
+  X_pathways_select <- reshape(
+    data = X_pathways_select,
+    direction = "long",
+    idvar = c("Sample_id", "Batch", "Status"),
+    varying = list(colnames(X_pathways_select)[-c(1:3)]),
+    v.names = "Value",
+    timevar = "Feature",
+    times = colnames(X_pathways_select)[-c(1:3)]
+  )
+
+  # add feature annotations
+  species_metadata_long <- species_metadata[X_species_select$Feature,]
+  X_species_select$Type <- species_metadata_long$phylum
+  X_species_select$Block <- "species"
+
+  pathways_metadata_long <- pathways_metadata[X_pathways_select$Feature,]
+  X_pathways_select$Type <- "pathways"
+  X_pathways_select$Block <- "pathways"
+
+  #append
+  X_select <- rbind(X_species_select, X_pathways_select)
+
+  # save
+  X_species_select_comp[[comp_to_plot]] <- X_species_select
+  X_pathways_select_comp[[comp_to_plot]] <- X_pathways_select
+  X_select_comp[[comp_to_plot]] <- X_select
+
+}
+```
+
+
+loop doesn't display the plots in the html - so doing manually for comp 1
+
+```{r}
+
+comp_to_plot <- 1
+
+# species boxplots
+
+X_select <- X_species_select_comp[[comp_to_plot]]
+ggplot(X_select, aes(x = Feature, y = Value, fill = Status)) +
+  geom_boxplot() +
+  facet_grid(Batch~.) +
+  theme_bw() +
+  theme(
+    plot.margin = unit(c(1, 1, 1, 2), "cm"),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor=element_blank(),
+    panel.grid.major = element_blank()
+    ) +
+  scale_fill_manual(values = brewer.pal(5, "Pastel1")[c(2,5)])
+
+ggsave(filename = file.path(plot_folder,paste0("boxplots_species_comp",comp_to_plot,".pdf")),
+       width = 20, height = 20, units = "cm")
+ggsave(filename = file.path(plot_folder,paste0("boxplots_species_comp",comp_to_plot,".png")),
+       width = 20, height = 20, units = "cm")
+
+# pathways boxplots
+
+X_select <- X_pathways_select_comp[[comp_to_plot]]
+ggplot(X_select, aes(x = Feature, y = Value, fill = Status)) +
+  geom_boxplot() +
+  facet_grid(Batch~.) +
+  theme_bw() +
+  theme(
+    plot.margin = unit(c(1, 1, 1, 2), "cm"),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_blank(),
+    panel.grid.minor=element_blank(),
+    panel.grid.major = element_blank()
+    ) +
+  scale_fill_manual(values = brewer.pal(5, "Pastel1")[c(2,5)])
+
+ggsave(filename = file.path(plot_folder,paste0("boxplots_pathways_comp",comp_to_plot,".pdf")),
+       width = 20, height = 20, units = "cm")
+ggsave(filename = file.path(plot_folder,paste0("boxplots_pathways_comp",comp_to_plot,".png")),
+       width = 20, height = 20, units = "cm")
+
+
+```

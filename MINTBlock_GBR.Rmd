@@ -1,0 +1,941 @@
+---
+title: "MINT Block Evaluation - GBR Data"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+# Setup
+
+Load the local mixOmics repo - contains changes yet to be implemented in bioconductor version
+
+```{r, warning=FALSE, message=FALSE}
+git_repo_path = file.path("..","GitHubRepo","mixOmics")
+setwd(git_repo_path)
+library(devtools)
+load_all(".")
+```
+
+Load in other libraries
+ 
+```{r, message=FALSE}
+library(ggplot2)
+library(phyloseq)
+library(dplyr)
+library(sva)
+library(limma)
+library(UpSetR)
+library(cluster)
+library(mclust)
+library(pheatmap)
+library(RColorBrewer)
+library(gridExtra)
+library(knitr)
+library(igraph)
+```
+
+Create some colour palettes
+
+```{r}
+my_Set1 <- brewer.pal(n=9, name="Set1")[-c(6)]
+my_Set3 <- brewer.pal(n=12, name="Set3")[-c(2,12)]
+my_Paired <- brewer.pal(n=12, name="Paired")[-c(11)]
+```
+
+Load functions
+
+```{r}
+# functions for benchmarking
+source("BenchmarkingFunctions.R")
+# load in tune function(s)
+function.path <- file.path("..","NewTuningFunctions","tune.mint.block.pls.R")
+source(function.path)
+function.path <- file.path("..","NewTuningFunctions","tune.mint.block.spls.R")
+source(function.path)
+```
+
+Output folders
+
+```{r}
+usecase_name <- 'GBR_1'
+plot_folder <- file.path('plots', usecase_name)
+```
+
+# Data
+
+## Load and explore
+
+Load data from Terzin paper
+
+```{r, warning=FALSE, message=FALSE}
+data.path.terzin1 = file.path("..","DataSources","SeawaterMicrobes_Terzin1","Terzin1_data.rds")
+input_data.terzin1 = readRDS(data.path.terzin1)
+taxa_terzin1 = input_data.terzin1$taxa_MINT
+GO_terzin1 = input_data.terzin1$GO_MINT
+continuous_env_terzin1 = as.matrix(input_data.terzin1$continuous_env_MINT_sPLS)
+study.terzin1 = input_data.terzin1$sample_metadata$Sampling_trip
+```
+
+Exploration of sample metadata
+
+```{r, warning=FALSE, message=FALSE}
+table(input_data.terzin1$sample_metadata$Sampling_trip, input_data.terzin1$sample_metadata$GBR_sector)
+```
+
+## Filter, tidy up, and select
+
+Extra pre-processing due to variables with constant values
+
+```{r, warning=FALSE, message=FALSE}
+## check taxa features
+taxa_terzin1.var.check <- do.call(rbind,
+                                 lapply(unique(study.terzin1),function(x){apply(taxa_terzin1[study.terzin1==x,], 2, FUN = "var", na.rm = TRUE)})
+)
+mean(colSums(taxa_terzin1.var.check==0)==0)
+taxa_terzin1 <- taxa_terzin1[,colSums(taxa_terzin1.var.check==0)==0]
+
+## check GO term features
+GO_terzin1.var.check <- do.call(rbind,
+                                 lapply(unique(study.terzin1),function(x){apply(GO_terzin1[study.terzin1==x,], 2, FUN = "var", na.rm = TRUE)})
+)
+mean(colSums(GO_terzin1.var.check==0)==0)
+GO_terzin1 <- GO_terzin1[,colSums(GO_terzin1.var.check==0)==0]
+
+## check environmental features
+continuous_env_terzin1.var.check <- do.call(rbind,
+                                 lapply(unique(study.terzin1),function(x){apply(continuous_env_terzin1[study.terzin1==x,], 2, FUN = "var", na.rm = TRUE)})
+)
+mean(colSums(continuous_env_terzin1.var.check==0)==0)
+continuous_env_terzin1 <- continuous_env_terzin1[,colSums(continuous_env_terzin1.var.check==0)==0]
+
+```
+
+Tidy up taxa variable names and metadata
+
+```{r}
+# extract metadata as a data frame
+taxa_metadata <- as.data.frame(input_data.terzin1$taxa_metadata)
+
+# ensure alignment
+taxa_metadata <- taxa_metadata[colnames(taxa_terzin1),]
+
+# save old ids
+taxa_metadata$original_id <- rownames(taxa_metadata)
+
+# how granular are the groupings?
+apply(taxa_metadata,2,function(x){
+  print(length(unique(x)))
+})
+
+# new grouping variable starting from most to least granular
+taxa_groups <- c('Species', 'Genus', 'Family', 'Order', 'Class', 'Phylum', 'Domain')
+new_group_null <- "NA"
+taxa_metadata$new_group <- new_group_null
+for (taxa_group in taxa_groups){
+  taxa_metadata$new_group[taxa_metadata$new_group==new_group_null] <- paste0(substr(taxa_group,1,1),"_",taxa_metadata[taxa_metadata$new_group==new_group_null,taxa_group])
+  new_group_null <- paste0(substr(taxa_group,1,1),"_NA")
+}
+
+# add informative grouping variable and old_id to create new_id
+taxa_metadata$new_id <- paste0(taxa_metadata$original_id,"_",taxa_metadata$new_group)
+
+# remove any commas
+taxa_metadata$new_id <- gsub(",",";",taxa_metadata$new_id) 
+
+# change row and column names
+rownames(taxa_metadata) <- taxa_metadata$new_id
+colnames(taxa_terzin1) <- rownames(taxa_metadata)
+
+```
+
+Tidy up GO variable names and metadata
+
+```{r}
+# create standalone metadata table
+GO_metadata <- as.data.frame(input_data.terzin1$GO_metadata)
+
+# ensure alignment
+GO_metadata <- GO_metadata[colnames(GO_terzin1),]
+
+# save old ids
+GO_metadata$original_id <- rownames(GO_metadata)
+
+# select a GO term and IPR term for each row
+GO_metadata$GO_term <- NA
+GO_metadata$IPR_term <- NA
+term_ranks <- c("Rank5", "Rank4", "Rank3")
+for (term_rank in term_ranks){
+  
+  # update GO term
+  require_GO <- is.na(GO_metadata$GO_term)
+  suitable_for_GO <- substr(GO_metadata[,term_rank],1,2)=="GO"
+  suitable_for_GO[is.na(suitable_for_GO)] = FALSE
+  GO_metadata$GO_term[require_GO & suitable_for_GO] <- GO_metadata[require_GO & suitable_for_GO,term_rank]
+  
+  # update IPR term
+  require_IPR <- is.na(GO_metadata$IPR_term)
+  suitable_for_IPR <- substr(GO_metadata[,term_rank],1,3)=="IPR"
+  suitable_for_IPR[is.na(suitable_for_IPR)] = FALSE
+  GO_metadata$IPR_term[require_IPR & suitable_for_IPR] <- GO_metadata[require_IPR & suitable_for_IPR,term_rank]
+}
+
+# add informative grouping variable and old_id to create new_id
+GO_metadata$new_id <- GO_metadata$IPR_term
+GO_metadata$new_id[is.na(GO_metadata$new_id)] <- GO_metadata$GO_term[is.na(GO_metadata$new_id)]
+GO_metadata$new_id <- paste0(GO_metadata$original_id,"_",GO_metadata$new_id)
+
+# remove any commas
+GO_metadata$new_id <- gsub(",",";",GO_metadata$new_id) 
+
+# change row and column names
+rownames(GO_metadata) <- GO_metadata$new_id
+colnames(GO_terzin1) <- rownames(GO_metadata)
+
+```
+
+Tidy up environmental variable names
+
+```{r}
+colnames(continuous_env_terzin1) <- gsub("median_","",colnames(continuous_env_terzin1))
+```
+
+Select data for Analysis
+
+```{r}
+fit_data = list(taxonomic = taxa_terzin1, functional = GO_terzin1, environmental = continuous_env_terzin1)
+sample.study = study.terzin1
+studies <- unique(sample.study)
+```
+
+Check how many variables and observations
+
+```{r}
+lapply(fit_data,function(x){dim(x)})
+```
+
+
+## Unwanted variation adjustment
+
+ComBat adjusted data
+
+```{r, warning=FALSE, message=FALSE}
+fit_data.combat = lapply(fit_data, function(x){
+   t(ComBat(t(x), batch = sample.study))
+})
+```
+
+RBE adjusted data
+
+```{r, warning=FALSE, message=FALSE}
+fit_data.RBE = lapply(fit_data, function(x){
+   t(removeBatchEffect(t(x), batch = sample.study))
+})
+```
+
+
+## Unwanted variation in raw data
+
+Get PCs for each block
+
+```{r}
+fit.pca <- lapply(names(fit_data), function(block){
+    PCA <- mixOmics::pca(X = fit_data[[block]], ncomp = 2, center = TRUE, scale = TRUE)$variates$X
+    PCA <- as.data.frame(scale(PCA))
+    PCA$block <- block
+    PCA$Trip <- as.factor(substr(sample.study,6,nchar(sample.study)))
+    return(PCA)
+})
+
+fit.pca <- do.call(rbind,fit.pca)
+```
+
+Plot to examine unwanted variation
+
+```{r}
+ggplot(fit.pca, aes(x = PC1, y = PC2, color = Trip)) +
+  geom_point(size = 2) +
+  facet_grid(~block) +
+  theme_bw()+
+  theme(
+    panel.grid.minor=element_blank(),
+    panel.grid.major=element_blank()
+    , strip.text = element_text(size = 16)
+    , axis.title = element_text(size = 14)
+    # , axis.text = element_text(size = 14)
+    , axis.text = element_blank()
+    , axis.ticks = element_blank()
+    , legend.title = element_text(size = 14)
+    , legend.text = element_text(size = 14)
+    # ,legend.position="none"
+    ) +
+  # scale_color_brewer(palette = "Dark2")
+  scale_color_manual(values = my_Set1)
+
+ggsave(file.path(plot_folder,'PCA.pdf'), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'PCA.png'), width = 20, height = 10, units = "cm") 
+
+```
+
+
+# Benchmarking with all data
+
+## Choose inputs
+
+```{r}
+# will use number of components and variables per component same as the article - tuning prior to deep dive
+ncomp <- 2
+keepX <- list(taxonomic=c(50,50), functional=c(50,50))
+studies <- unique(sample.study)
+indY <- 3
+mode <- 'regression'
+```
+
+## Fit using all data
+
+```{r}
+fit.block.spls.full = block.spls(X = fit_data, indY = indY, ncomp = ncomp, keepX = keepX, mode = mode)
+fit.block.spls.combat.full = block.spls(X = fit_data.combat, indY = indY, ncomp = ncomp, keepX = keepX, mode = mode)
+fit.block.spls.RBE.full = block.spls(X = fit_data.RBE, indY = indY, ncomp = ncomp, keepX = keepX, mode = mode)
+fit.mint.block.spls.full = mint.block.spls(X = fit_data, indY = indY, study=sample.study, ncomp = ncomp, keepX = keepX, mode = mode)
+```
+
+## Quantitative measures of spread
+
+```{r}
+fits <- list(
+  "Block_spls" = fit.block.spls.full,
+  "Block_spls_combat" = fit.block.spls.combat.full,
+  "Block_spls_rbe" = fit.block.spls.RBE.full,
+  "MINT Block_spls" = fit.mint.block.spls.full
+)
+```
+
+### R2 from linear models
+
+Extract and plot r2 values by block and model
+
+```{r}
+r2.all.fits <- extract.fit.r2(fits = fits, blocks = names(fit_data), studies = sample.study)
+
+r2.all.fits$r2_rnd <-  round(r2.all.fits$r2,2)
+print(r2.all.fits)
+
+ggplot(r2.all.fits) + 
+  geom_point(aes(x = fit, y = r2, color = fit)
+             # , position = position_dodge(width = 0.25)
+             ) + 
+  labs(
+    # title = "GBR",
+    x = "Fit",
+    y = "R2"
+    ) +
+  facet_grid(comp~block) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor=element_blank(),
+    legend.position="none"
+    ) +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(file.path(plot_folder,'R2_study.pdf'), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'R2_study.png'), width = 20, height = 10, units = "cm") 
+```
+
+
+### Silhouette cofficients
+
+Extract average silhouette widths by fit, block and study
+
+```{r}
+sc.df <- extract.fit.sc(fits = fits, blocks = names(fit_data), studies = sample.study)
+
+# dot plot of ave_width values by fit, block, and study
+ggplot(sc.df) + 
+  geom_point(aes(x = fit, y = ave_width, color = study.name) 
+             # ,position = position_dodge(width = 0.25)
+             ) + 
+  labs(
+    # title = "GBR",
+    x = "Fit",
+    y = "Average width"
+    ) +
+  facet_grid(~block) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor=element_blank()
+    ) +
+  scale_color_manual(values = my_Set1)
+
+
+ggsave(file.path(plot_folder,'silhouette_study.pdf'), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'silhouette_study.png'), width = 20, height = 10, units = "cm") 
+```
+
+
+### ARI values based on clustering
+
+Compared to study groups
+
+```{r}
+ari.all.fits <- extract.fit.ari(fits = fits, blocks = names(fit_data), studies = sample.study)
+
+ari.all.fits$ari_rnd <-  round(ari.all.fits$ari,2)
+print(ari.all.fits)
+
+# dot plot of ave_width values by fit, block, and study
+ggplot(ari.all.fits) + 
+  geom_point(aes(x = fit, y = ari, color = fit)
+             # , position = position_dodge(width = 0.25), size = 3
+             ) + 
+  labs(
+    # title = "GBR",
+    x = "Fit",
+    y = "ARI"
+    ) +
+  facet_grid(~block) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor=element_blank(),
+    legend.position="none"
+    ) +
+  scale_color_brewer(palette = "Dark2")
+
+ggsave(file.path(plot_folder,'ARI_study.pdf'), width = 15, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'ARI_study.png'), width = 15, height = 10, units = "cm") 
+```
+
+
+# Benchmark using subsets
+
+## Fit models 
+
+block.spls on raw data
+
+```{r}
+fit.block.spls = sapply(studies, function(x){
+  InTrain = !is.element(sample.study,x)
+  fit_data.train = lapply(fit_data, function(y){y[InTrain,]})
+  fit = block.spls(X = fit_data.train, indY = indY, ncomp = ncomp, keepX = keepX, mode = mode)
+}, simplify = FALSE, USE.NAMES = TRUE)
+```
+
+block.spls on combat adjusted data (each training dataset adjusted independently)
+
+```{r, message=FALSE}
+fit.block.spls.combat = sapply(studies, function(x){
+  InTrain = !is.element(sample.study,x)
+  fit_data.train = lapply(fit_data, function(y){
+    t(ComBat(t(y[InTrain,]), batch = sample.study[InTrain]))
+    })
+  fit = block.spls(X = fit_data.train, indY = indY, ncomp = ncomp, keepX = keepX, mode = mode)
+}, simplify = FALSE, USE.NAMES = TRUE)
+```
+
+block.spls on RBE adjusted data (each training dataset adjusted independently)
+
+```{r, message=FALSE}
+fit.block.spls.RBE = sapply(studies, function(x){
+  InTrain = !is.element(sample.study,x)
+  fit_data.train = lapply(fit_data, function(y){
+    t(removeBatchEffect(t(y[InTrain,]), batch = sample.study[InTrain]))
+    })
+  fit = block.spls(X = fit_data.train, indY = indY, ncomp = ncomp, keepX = keepX, mode = mode)
+}, simplify = FALSE, USE.NAMES = TRUE)
+```
+
+mint.block.spls fit
+
+```{r}
+fit.mint.block.spls = sapply(studies, function(x){
+  InTrain = !is.element(sample.study,x)
+  sample.study.train = sample.study[InTrain]
+  fit_data.train = lapply(fit_data, function(y){y[InTrain,]})
+  fit = mint.block.spls(X = fit_data.train, indY = indY, study = sample.study.train, ncomp = ncomp, keepX = keepX, mode = mode)
+}, simplify = FALSE, USE.NAMES = TRUE)
+```
+
+
+## Extract features and compare stability across subsets
+
+Extract and plot for all fits
+
+```{r}
+fits = list(
+  "Block_spls" = fit.block.spls,
+  "Block_spls_combat" = fit.block.spls.combat,
+  "Block_spls_rbe" = fit.block.spls.RBE,
+  "MINT Block_spls" = fit.mint.block.spls
+)
+
+#####
+# stability using all components
+####
+
+selection_frequency_th <- length(fits[[1]]) * (1/2)
+# features selected in > selection_frequency_th studies put in the 'more' group
+
+fit.feature.props = extract.fit.feature.props(
+  fits = fits, 
+  blocks = c("taxonomic", "functional"), 
+  selection_frequency_th = selection_frequency_th,
+  begin_comp = 1,
+  end_comp = ncomp
+  )
+
+
+# plot the feature selection proportions by fit and block and frequency
+ggplot(fit.feature.props) + 
+  geom_col(aes(x = selection_frequency, y = proportion_of_features, fill = fit), position = 'dodge') + 
+  labs(
+    x = "Selection frequency",
+    y = "Proportion of variables"
+    ) +
+  facet_grid(~block) +
+  theme_bw() +
+  theme(
+    # axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor=element_blank()
+    ) +
+  scale_fill_brewer(palette = "Set2")+
+  labs(fill = "Fit")
+
+ggsave(file.path(plot_folder,'stability_all.pdf'), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'stability_all.png'), width = 20, height = 10, units = "cm") 
+
+# print proportion of features selected across all fits
+
+print(
+  fit.feature.props[fit.feature.props$selection_frequency==max(fit.feature.props$selection_frequency),]
+)
+
+# print proportions by frequency group
+
+fit.feature.props.group <- fit.feature.props %>%
+  group_by(block, fit, selection_frequency_group) %>%
+  summarise(proportion = sum(proportion_of_features)) %>%
+  as.data.frame()
+fit.feature.props.group$proportion <- round(fit.feature.props.group$proportion,2)
+
+print(fit.feature.props.group)
+
+# print weighted stability score by block and model
+
+fit.feature.props.global <- fit.feature.props %>%
+  group_by(block, fit) %>%
+  summarise(ave_freq = sum(wghtd_freq)) %>%
+  as.data.frame()
+fit.feature.props.global$stability <- round(fit.feature.props.global$ave_freq / length(studies),2)
+fit.feature.props.global$ave_freq <- round(fit.feature.props.global$ave_freq,2)
+
+print(fit.feature.props.global)
+
+```
+
+
+# In depth analysis with MINT Block
+
+## Tune number of components
+
+```{r}
+ncomp <- 4
+
+tuned.mint.block.pls = tune.mint.block.pls(
+  X = fit_data,
+  indY = indY,
+  ncomp = ncomp,
+  mode = mode,
+  study = sample.study
+)
+```
+
+
+Print the suggested number of components
+
+```{r}
+print(tuned.mint.block.pls$loocv.ncomp$choice.ncomp)
+print(tuned.mint.block.pls$loocv.ncomp$choice.ncomp.study)
+```
+
+Plot the Q2 values
+
+```{r}
+plot.df <- tuned.mint.block.pls$loocv.ncomp$Q2.study[[names(fit_data[indY])]]
+plot.df$Trip <- plot.df$study
+ggplot(plot.df, aes(x = comp, y = Q2, color = Trip)) +
+  geom_point() +
+  geom_hline(yintercept = tuned.mint.block.pls$loocv.ncomp$limQ2, color="red", linetype="dashed") +
+  stat_summary(geom="line", fun = "mean", color="black", linetype="dashed") +
+  stat_summary(geom="point", fun = "mean", color="black") +
+  theme_bw()+
+  theme(
+    panel.grid.minor=element_blank()
+    ) +
+  scale_color_manual(values = my_Set1)
+
+ggsave(file.path(plot_folder,'ncomp.pdf'), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'ncomp.png'), width = 20, height = 10, units = "cm") 
+```
+
+Plot the MPSE values
+
+```{r}
+plot.df <- tuned.mint.block.pls$loocv.ncomp$MPSE.study[[names(fit_data[indY])]]
+ggplot(plot.df, aes(x = comp, y = MPSE, color = study)) +
+  geom_point() +
+  stat_summary(geom="line", fun = "mean", color="black", linetype="dashed") +
+  stat_summary(geom="point", fun = "mean", color="black") +
+  theme_bw()+
+  theme(
+    panel.grid.minor=element_blank()
+    )+
+  scale_color_manual(values = my_Set1)
+```
+
+
+## Tune the number of variables
+
+```{r}
+# ncomp = 2
+# 
+# test.keepX <- list(
+#   taxonomic = c(25,50),
+#   functional = c(25,50),
+#   environmental = c(5,10)
+# )
+# 
+# test.measure = "covRatio"
+# 
+# tuned.mint.block.spls = tune.mint.block.spls(
+#   X = fit_data,
+#   indY = indY,
+#   ncomp = ncomp,
+#   mode = mode,
+#   test.keepX = test.keepX,
+#   test.measure = test.measure,
+#   study = sample.study,
+#   use.ttest = FALSE
+# )
+# 
+# # export results as the tuning is time consuming
+# saveRDS(tuned.mint.block.spls,file.path(plot_folder,'tuned.mint.block.spls.rds'))
+
+# import saved tuning result
+tuned.mint.block.spls <- readRDS(file.path(plot_folder,'tuned.mint.block.spls.rds'))
+```
+
+Print out the results
+
+```{r}
+print(tuned.mint.block.spls$loocv.variable.selection$choice.keepX)
+```
+
+Plot aggregated values
+
+```{r}
+comp.to.plot <- 1
+plot.df <- tuned.mint.block.spls$loocv.variable.selection$compareVals.sum.comp[[paste0("comp",comp.to.plot)]]
+measure.to.plot <- 'covRatio'
+x1.axis.var <- 'keep_taxonomic'
+x2.axis.var <- 'keep_functional'
+y.axis.var <- 'keep_environmental'
+
+plot.df$measure.to.plot <- plot.df[,measure.to.plot]
+plot.df$x1.axis.var <- plot.df[,x1.axis.var]
+plot.df$x2.axis.var <- plot.df[,x2.axis.var]
+plot.df$y.axis.var <- plot.df[,y.axis.var]
+
+ggplot(plot.df, aes(x = x1.axis.var, y = x2.axis.var, fill= measure.to.plot)) + 
+  geom_tile() + 
+  facet_grid(~y.axis.var) +
+  theme_bw()+
+  labs(
+    x = x1.axis.var,
+    y = x2.axis.var,
+    fill = measure.to.plot
+  )
+
+ggsave(file.path(plot_folder,'nvar.pdf'), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'nvar.png'), width = 20, height = 10, units = "cm")
+```
+
+## Refit
+
+Refit the model with all data
+Will go with 25 per X block as it gives more informative / interpretable results (later on)
+
+```{r}
+ncomp <- 2
+keepX <- list(taxonomic=c(25, 25), functional=c(25, 25), environmental = c(5,5))
+fit.mint.block.spls.full = mint.block.spls(X = fit_data, indY = indY, study=sample.study, ncomp = ncomp, keepX = keepX, mode = mode)
+```
+
+
+## Plots
+
+### Global variates coloured by batch
+
+```{r}
+# create long format data frame
+
+variates.global <- sapply(names(fit.mint.block.spls.full$variates), function(block){
+  block.variates <- as.data.frame(fit.mint.block.spls.full$variates[[block]])
+  block.variates$block <- block
+  block.variates$Batch <- fit.mint.block.spls.full$study
+  block.variates$Trip <- as.factor(substr(as.character(fit.mint.block.spls.full$study),6,nchar(as.character(fit.mint.block.spls.full$study))))
+  return(block.variates)
+},simplify = FALSE,USE.NAMES = TRUE)
+
+variates.global <- do.call('rbind',variates.global)
+
+# plot the component values
+
+ggplot(variates.global, aes(x = comp1, y = comp2, color = Trip)) +
+  geom_point(size=2) +
+  facet_grid(~block) +
+  theme_bw()+
+  theme(
+    panel.grid.minor=element_blank(),
+    panel.grid.major=element_blank()
+    , strip.text = element_text(size = 16)
+    , axis.title = element_text(size = 14)
+    # , axis.text = element_text(size = 14)
+    , axis.text = element_blank()
+    , axis.ticks = element_blank()
+    , legend.title = element_text(size = 14)
+    , legend.text = element_text(size = 14)
+    # ,legend.position="none"
+    ) +
+  # scale_color_brewer(palette = "Dark2")
+  scale_color_manual(values = my_Set1)
+
+ggsave(file.path(plot_folder,"variates_global_comp12_all.pdf"), width = 20, height = 10, units = "cm") 
+ggsave(file.path(plot_folder,'variates_global_comp12_all.png'), width = 20, height = 10, units = "cm") 
+```
+
+
+Calculate correlations between global variates
+
+```{r}
+variates.global <- sapply(names(fit.mint.block.spls.full$variates), function(block){
+  block.variates <- fit.mint.block.spls.full$variates[[block]]
+  colnames(block.variates) <- paste0(block,'_',colnames(block.variates))
+  return(block.variates)
+},simplify = FALSE,USE.NAMES = TRUE)
+
+variates.global <- do.call('cbind',variates.global)
+
+variates.global.cor <- round(cor(variates.global),2)
+
+print(variates.global.cor)
+```
+
+
+### plotVar
+
+```{r}
+png(file.path(plot_folder,'plotVar.png'))
+plotVar(fit.mint.block.spls.full, 
+        var.names = FALSE, style = 'graphics', legend = TRUE, 
+        pch = c(16, 17, 18), cex = c(1, 1, 1), 
+        col = my_Paired[c(11, 10, 4)])
+dev.off()
+
+pdf(file.path(plot_folder,'plotVar.pdf'))
+plotVar(fit.mint.block.spls.full, 
+        var.names = FALSE, style = 'graphics', legend = TRUE, 
+        pch = c(16, 17, 18), cex = c(1, 1, 1), 
+        col = my_Paired[c(11, 10, 4)])
+dev.off()
+
+knitr::include_graphics(file.path(plot_folder,'plotVar.png'))
+```
+
+
+### Global loadings plots
+
+```{r}
+for (comp in 1:ncomp){
+  for (block in names(fit_data)){
+    
+    png(file.path(plot_folder, paste0('plotLoadings_',block,comp,'.png')))
+    plotLoadings(
+      fit.mint.block.spls.full 
+      ,comp = comp 
+      ,contrib = 'max' 
+      ,method = 'median'
+      ,block = block
+      ,ndisplay = 25
+      ,size.title = 0.001
+      ,legend = FALSE
+      ,size.name = 0.75
+      )
+    dev.off()
+    pdf(file.path(plot_folder, paste0('plotLoadings_',block,comp,'.pdf')))
+    plotLoadings(
+      fit.mint.block.spls.full 
+      ,comp = comp 
+      ,contrib = 'max' 
+      ,method = 'median'
+      ,block = block
+      ,ndisplay = 25
+      ,size.title = 0.001
+      ,legend = FALSE
+      ,size.name = 0.75
+      )
+    dev.off()
+  }
+}
+
+knitr::include_graphics(file.path(plot_folder,paste0('plotLoadings_',names(fit_data)[1], 1,'.png')))
+knitr::include_graphics(file.path(plot_folder,paste0('plotLoadings_',names(fit_data)[1], 2,'.png')))
+knitr::include_graphics(file.path(plot_folder,paste0('plotLoadings_',names(fit_data)[2], 1,'.png')))
+knitr::include_graphics(file.path(plot_folder,paste0('plotLoadings_',names(fit_data)[2], 2,'.png')))
+knitr::include_graphics(file.path(plot_folder,paste0('plotLoadings_',names(fit_data)[3], 1,'.png')))
+knitr::include_graphics(file.path(plot_folder,paste0('plotLoadings_',names(fit_data)[3], 2,'.png')))
+```
+
+### Heatmaps of correlations
+
+Select variables to plot
+
+```{r}
+ndisplay <- 25
+taxonomic_select_comp <- vector("list")
+functional_select_comp <- vector("list")
+environmental_select_comp <- vector("list")
+
+for (comp_to_plot in 1:ncomp){
+  
+  # select features form each block
+  
+  taxonomic_rank <- rank(-abs(fit.mint.block.spls.full$loadings$taxonomic[,comp_to_plot]))
+  # taxonomic_select <- fit.mint.block.spls.full$loadings$taxonomic[,comp_to_plot]!=0
+  taxonomic_select <- (fit.mint.block.spls.full$loadings$taxonomic[,comp_to_plot]!=0) & (taxonomic_rank <= ndisplay)
+  
+  functional_rank <- rank(-abs(fit.mint.block.spls.full$loadings$functional[,comp_to_plot]))
+  # functional_select <- fit.mint.block.spls.full$loadings$functional[,comp_to_plot]!=0
+  functional_select <- (fit.mint.block.spls.full$loadings$functional[,comp_to_plot]!=0) & (functional_rank <= ndisplay)
+  
+  environmental_rank <- rank(-abs(fit.mint.block.spls.full$loadings$environmental[,comp_to_plot]))
+  # environmental_select <- fit.mint.block.spls.full$loadings$environmental[,comp_to_plot]!=0
+  environmental_select <- (fit.mint.block.spls.full$loadings$environmental[,comp_to_plot]!=0) & (environmental_rank <= ndisplay)
+  
+  # save for the component
+  taxonomic_select_comp[[comp_to_plot]] <- taxonomic_select
+  functional_select_comp[[comp_to_plot]] <- functional_select
+  environmental_select_comp[[comp_to_plot]] <- environmental_select
+  
+}
+```
+
+
+Use the network function to get the correlations between features
+
+```{r}
+# network function with no cutoff to get the correlation matrix and all edges
+fit.network.all <- network(fit.mint.block.spls.full,
+        blocks = c(1,2,3),
+        cutoff = 0,
+        color.node = my_Paired[c(10,11,4)],
+        save = 'png', name.save = file.path(plot_folder,'diablo-network-all')
+        )
+```
+
+Extract the correlation matrix and plot with a heatmap
+
+```{r}
+# just correlations with the environmental vars for now
+# check alignment
+colnames(fit.network.all$M_taxonomic_environmental) == colnames(fit.network.all$M_functional_environmental)
+
+for (comp_to_plot in 1:ncomp){
+  
+  cor_Mat <- rbind(fit.network.all$M_taxonomic_environmental,fit.network.all$M_functional_environmental)
+  #remove rownames suffix
+  suffixes <- paste0("_",names(fit_data))
+  for (suffix in suffixes){
+    # remove from 'from' column
+    if_remove <- substr(rownames(cor_Mat), nchar(rownames(cor_Mat)) - nchar(suffix) + 1, nchar(rownames(cor_Mat))) == suffix
+    rownames(cor_Mat)[if_remove] <- substr(rownames(cor_Mat)[if_remove], 1, nchar(rownames(cor_Mat)[if_remove]) - nchar(suffix))
+    
+    # remove from 'to' column
+    if_remove <- substr(colnames(cor_Mat), nchar(colnames(cor_Mat)) - nchar(suffix) + 1, nchar(colnames(cor_Mat))) == suffix
+    colnames(cor_Mat)[if_remove] <- substr(colnames(cor_Mat)[if_remove], 1, nchar(colnames(cor_Mat)[if_remove]) - nchar(suffix))
+  }
+  
+  # filter to include those for the component
+  cor_Mat <- cor_Mat[is.element(rownames(cor_Mat),
+                                c(names(taxonomic_select_comp[[comp_to_plot]])[taxonomic_select_comp[[comp_to_plot]]],
+                                  names(functional_select_comp[[comp_to_plot]])[functional_select_comp[[comp_to_plot]]],
+                                  names(environmental_select_comp[[comp_to_plot]])[environmental_select_comp[[comp_to_plot]]])
+                                ),]
+  cor_Mat <- cor_Mat[,is.element(colnames(cor_Mat),
+                                 c(names(taxonomic_select_comp[[comp_to_plot]])[taxonomic_select_comp[[comp_to_plot]]],
+                                  names(functional_select_comp[[comp_to_plot]])[functional_select_comp[[comp_to_plot]]],
+                                  names(environmental_select_comp[[comp_to_plot]])[environmental_select_comp[[comp_to_plot]]])
+                                 )]
+  
+  # get metadata
+  metadata_cor_Mat <- data.frame(
+  variable_id = c(taxa_metadata$new_id, GO_metadata$new_id),
+  block = c(rep("taxonomic",length(taxa_metadata$new_id)), rep("functional",length(GO_metadata$new_id)))
+  # ,group = c(taxa_metadata$Domain, GO_metadata$Rank2)
+  )
+  # metadata_cor_Mat$group <- paste0(metadata_cor_Mat$block,"_",metadata_cor_Mat$group)
+  rownames(metadata_cor_Mat) <- metadata_cor_Mat$variable_id
+  metadata_cor_Mat <- metadata_cor_Mat[rownames(cor_Mat),]
+  
+  
+  # set annotation colours for the plot
+  metadata_cor_annotation <- data.frame(
+      block = as.factor(metadata_cor_Mat$block)
+      # ,group = as.factor(metadata_cor_Mat$group)
+    )
+  rownames(metadata_cor_annotation) <- rownames(cor_Mat)
+  
+  annot_colors <- list(
+    block  = my_Paired[c(10, 11)]
+    # ,group = my_Set3[1:nlevels(metadata_cor_annotation$group)]
+    )
+  
+  names(annot_colors$block) <- levels(metadata_cor_annotation$block)
+  # names(annot_colors$group) <- levels(metadata_cor_annotation$group)
+  
+  # plot
+    
+  hm_cor <- pheatmap(
+      # mat = t(cor_Mat),
+      # annotation_col = MAGs_annotation,
+      # annotation_row = environmental_annotation,
+      mat = cor_Mat,
+      annotation_row = metadata_cor_annotation,
+      # annotation_col = environmental_annotation,
+      border_color = NA,
+      cellwidth = 20,
+      cellheight = 20,
+      cluster_rows = TRUE,
+      cluster_cols = TRUE,
+      show_rownames = TRUE,
+      show_colnames = TRUE,
+      fontsize = 14,
+      angle_col = "45",
+      treeheight_row = 0,
+      treeheight_col = 0,
+      annotation_colors = annot_colors
+    )
+  
+  ggsave(filename = file.path(plot_folder,paste0("heatmap_cor_comp",comp_to_plot,".pdf")), 
+         plot = hm_cor[[4]],
+         width = 40, height = 40, units = "cm")
+  ggsave(filename = file.path(plot_folder,paste0("heatmap_cor_comp",comp_to_plot,".png")), 
+         plot = hm_cor[[4]],
+         width = 40, height = 40, units = "cm")
+
+}
+```
