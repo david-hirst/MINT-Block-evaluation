@@ -10,4 +10,5 @@ Overview of the MINT Block NP-integration framework. **a)** MINT Block performs 
 
 # MINT Block evaluation code repository contents
 
+This repository contains the code we used for evaluating MINT Block.
 
