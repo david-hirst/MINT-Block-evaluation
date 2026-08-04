@@ -12,7 +12,14 @@ Overview of the MINT Block NP-integration framework. **a)** MINT Block performs 
 
 This repository contains the code we used for evaluating MINT Block, organised in 2 folders.
 
-The [analysis](https://github.com/david-hirst/MINT-Block-evaluation/tree/main/analysis) contains files with the R code used to evaluate MINT Block on real multi-omics data. There is a different .rmd file for each dataset we used. Additionally the folder contains an [.rmd file](https://github.com/david-hirst/MINT-Block-evaluation/blob/main/analysis/T2D_DataPrep.Rmd) with the code we used to download and combine a T2D data.
+The [analysis](https://github.com/david-hirst/MINT-Block-evaluation/tree/main/analysis) folder contains files with the R code used to evaluate MINT Block on real multi-omics data. There is a different .rmd file for each dataset we used. Additionally the folder contains an [.rmd file](https://github.com/david-hirst/MINT-Block-evaluation/blob/main/analysis/T2D_DataPrep.Rmd) with the code we used to download and combine a T2D data. 
+
+The [helpers](https://github.com/david-hirst/MINT-Block-evaluation/tree/main/helpers) folder contains functions we created to use in the analyses. Included in the folder are the newly created functions for tuning: 
+
+- [the number of components for a regression model](https://github.com/david-hirst/MINT-Block-evaluation/blob/main/helpers/tune.mint.block.pls.R)
+- [the number of components for a classification model](https://github.com/david-hirst/MINT-Block-evaluation/blob/main/helpers/tune.mint.block.plsda.R)
+- [the number of variables selected for a regression model](https://github.com/david-hirst/MINT-Block-evaluation/blob/main/helpers/tune.mint.block.spls.R)
+- [the number of variables selected for a classification model](https://github.com/david-hirst/MINT-Block-evaluation/blob/main/helpers/tune.mint.block.splsda.R)
 
 
 
