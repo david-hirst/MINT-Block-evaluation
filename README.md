@@ -10,5 +10,9 @@ Overview of the MINT Block NP-integration framework. **a)** MINT Block performs 
 
 # MINT Block evaluation code repository contents
 
-This repository contains the code we used for evaluating MINT Block.
+This repository contains the code we used for evaluating MINT Block, organised in 2 folders.
+
+The [analysis](https://github.com/david-hirst/MINT-Block-evaluation/tree/main/analysis) contains files with the R code used to evaluate MINT Block on real multi-omics data. There is a different .rmd file for each dataset we used. Additionally the folder contains an [.rmd file](https://github.com/david-hirst/MINT-Block-evaluation/blob/main/analysis/T2D_DataPrep.Rmd) with the code we used to download and combine a T2D data.
+
+
 
