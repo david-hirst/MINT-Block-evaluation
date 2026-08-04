@@ -1,0 +1,413 @@
+---
+title: "T2D Data Prep"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+# Setup
+
+load in libraries
+ 
+```{r, message=FALSE}
+library(curatedMetagenomicData)
+library(SummarizedExperiment)
+library(dplyr)
+library(compositions)
+```
+
+
+Paths for saving and / or loading
+
+```{r}
+# downloaded data path
+raw.data.path.CMD = "all_expdata_raw.rds"
+processed.data.path.CMD = "QS_expdata_processed.rds"
+```
+
+
+# Initial exploration
+
+what type of data is available for a particular study
+
+```{r}
+# curatedMetagenomicData("QinJ_2012.+")
+```
+
+Look at available data for a certain study and type
+
+```{r}
+# # tried 'relative_abundance' and it looks like standard summarised experiment object
+# # tried 'pathway_abundance' and it seems good
+# studyTostudy = "QinJ_2012.relative_abundance"
+# expdat = curatedMetagenomicData(pattern = studyTostudy, dryrun = FALSE, counts = TRUE, rownames = "short") 
+# 
+# # the assay
+# expdat.assay = assay(expdat[[1]])
+# View(expdat.assay)
+# dim(expdat.assay)
+# 
+# # feature metadata
+# feature.metadata = as.data.frame(rowData(expdat[[1]]))
+# View(feature.metadata)
+# # feature metadata only available for relative abundance, not for pathway abundance
+# 
+# # sample metadata
+# sample.metadata = as.data.frame(colData(expdat[[1]]))
+# View(sample.metadata)
+# View(sample.metadata[c("study_name", "subject_id", "study_condition", "disease")])
+# table(sample.metadata$study_condition, sample.metadata$disease)
+```
+
+# Obtain data
+
+Collate taxa and pathway data for the 6 CMD studies
+
+Load in raw data if already downloaded from the repository and saved
+
+```{r}
+all_expdata_raw = readRDS(raw.data.path.CMD)
+
+# Filter studies based on previous work?
+all_study_names = names(all_expdata_raw)
+OS_study_names = c("HMP_2019_t2d" ,"FengQ_2015", "KarlssonFH_2013", "LiJ_2014", "YuJ_2015")
+FS_study_names = c("HMP_2019_t2d" , "YuJ_2015", "SankaranarayananK_2015")
+# Or based on the study design?
+QS_study_names = all_study_names[all_study_names!="HMP_2019_t2d"]
+
+# FILTER AT THIS STEP
+all_expdata_raw = all_expdata_raw[QS_study_names]
+
+```
+
+Or fetch from the repository
+
+```{r, message=FALSE}
+
+# study_names = c("HMP_2019_t2d", "FengQ_2015", "KarlssonFH_2013", "LiJ_2014", "YuJ_2015", "SankaranarayananK_2015")
+# 
+# all_expdata_raw = sapply(study_names, function(study_name){
+# 
+#   relative_abundance = curatedMetagenomicData(pattern = paste0(study_name,".relative_abundance"), dryrun = FALSE, counts = TRUE, rownames = "short")
+#   pathway_abundance = curatedMetagenomicData(pattern = paste0(study_name,".pathway_abundance"), dryrun = FALSE, counts = TRUE, rownames = "short")
+# 
+#   expdat = list(
+#     species = assay(relative_abundance[[1]]),
+#     species_metadata = as.data.frame(rowData(relative_abundance[[1]])),
+#     pathways = assay(pathway_abundance[[1]]),
+#     sample_metadata = as.data.frame(colData(relative_abundance[[1]]))
+#   )
+# 
+# }, simplify = FALSE, USE.NAMES = TRUE)
+# 
+# 
+# saveRDS(object = all_expdata_raw, file = raw.data.path.CMD)
+```
+
+
+# Pre-process data
+
+Load in saved file of pre-processed data if already done
+
+```{r}
+# all_expdata = readRDS(processed.data.path.CMD)
+# study_names = names(all_expdata)
+```
+
+or carry out the preprocessing and save
+
+## Pre-process by study
+
+first check the sample metadata to see how to filter
+
+```{r}
+# sample_conditions = lapply(all_expdata_raw, function(expdata){
+#   table(expdata$sample_metadata$study_condition, expdata$sample_metadata$disease)
+# })
+# sample_conditions[[6]]
+```
+
+
+### Fix up pathways data
+
+```{r}
+all_expdata <- lapply(all_expdata_raw, function(expdata){
+  
+  # extract matrix and turn into long format data frame
+  pathways_df <- as.data.frame(
+    t(expdata$pathways)
+  )
+  pathways_df$sample_id <- rownames(pathways_df)
+  
+  pathways_df <- reshape(
+    data = pathways_df,
+    direction = "long",
+    idvar = c("sample_id"),
+    varying = list(colnames(pathways_df)[-ncol(pathways_df)]),
+    v.names = "value",
+    timevar = "feature_id",
+    times = colnames(pathways_df)[-ncol(pathways_df)]
+  )
+  
+  # extract shorter names
+  pathways_df$feature_name_short_position <- unlist(regexpr(":", pathways_df$feature_id))-1
+  pathways_df$feature_name_long_position <- unlist(regexpr("\\|", pathways_df$feature_id))-1
+  
+  pathways_df$feature_name_long_beg <- ((pathways_df$feature_name_short_position < 0) * 1) + ((pathways_df$feature_name_short_position >= 0) * (pathways_df$feature_name_short_position + 3)) 
+  pathways_df$feature_name_long_end <- ((pathways_df$feature_name_long_position < 0) * nchar(pathways_df$feature_id)) + ((pathways_df$feature_name_long_position >= 0) * pathways_df$feature_name_long_position)
+  pathways_df$feature_name_short_end <- ((pathways_df$feature_name_short_position < 0) * pathways_df$feature_name_long_end) + ((pathways_df$feature_name_short_position >= 0) * pathways_df$feature_name_short_position) 
+  
+  pathways_df$feature_name_short <- substr(pathways_df$feature_id, 1, pathways_df$feature_name_short_end)
+  pathways_df$feature_name_long <- substr(pathways_df$feature_id, pathways_df$feature_name_long_beg, pathways_df$feature_name_long_end)
+  
+  # filter out unknown pathways
+  pathways_df <- pathways_df[!is.element(pathways_df$feature_name_short,c('UNMAPPED', 'UNINTEGRATED')),]
+  
+  # aggregate for metadata
+  pathways_metadata <- pathways_df %>%
+    distinct(feature_name_short, feature_name_long) %>%
+    as.data.frame()
+  rownames(pathways_metadata) <- pathways_metadata$feature_name_short
+  
+  # aggregate to recreate the abundance matrix
+  pathways_df <- pathways_df %>%
+    group_by(sample_id, feature_name_short) %>%
+    summarise(total_value = sum(value, na.rm = TRUE)) %>%
+    as.data.frame()
+  
+  # reshape
+  pathways_df <- reshape(
+    data = pathways_df,
+    direction = "wide",
+    idvar = "feature_name_short",
+    timevar = "sample_id"
+  )
+  
+  # tidy up names
+  rownames(pathways_df) <- pathways_df$feature_name_short
+  pathways_df <- pathways_df[,-1]
+  colnames(pathways_df) <- substr(colnames(pathways_df),13,nchar(colnames(pathways_df)))
+  
+  # return matrix with samples in the correct order
+  pathways_mat <- as.matrix(pathways_df)
+  pathways_mat <- pathways_mat[,rownames(expdata$sample_metadata)]
+  
+  # return list
+  expdata = list(
+    species = expdata$species,
+    species_metadata = expdata$species_metadata,
+    pathways = pathways_mat,
+    pathways_metadata = pathways_metadata,
+    sample_metadata = expdata$sample_metadata
+  )
+  
+})
+
+```
+
+Here I am filtering by study and performing the CLR transformation before merging. 
+After this step, features are removed if not observed in enough studies
+
+### Filter by study
+
+```{r}
+filt_th <- 10
+# features included if > filt_th% of samples have a val != 0 in a given study for at least 1 response group
+
+all_expdata = lapply(all_expdata, function(expdata){
+  
+  # filter samples
+  # only healthy or T2D samples
+  samples_include = rownames(expdata$sample_metadata)[grepl("healthy",expdata$sample_metadata$disease) | grepl("T2D",expdata$sample_metadata$disease)]
+  # EXTRA FILTERING TO REMOVE TUMOUR SAMPLES?
+  # NO - we have decided to include cancer samples due to the presence of other comorbidities
+  # if(processed.data.path.CMD == "QS_expdata_processed.rds"){
+  #   samples_include = samples_include[is.element(samples_include,rownames(expdata$sample_metadata)[!is.element(expdata$sample_metadata$study_condition,c("adenoma","CRC"))])]
+  # }
+  # intersecting samples
+  samples_include = samples_include[is.element(samples_include,colnames(expdata$species))]
+  samples_include = samples_include[is.element(samples_include,colnames(expdata$pathways))]
+  # filter samples
+  sample_metadata = expdata$sample_metadata[samples_include,]
+  # add in response variable
+  sample_metadata$response = sample_metadata$disease
+  sample_metadata$response[sample_metadata$response!="healthy"] = "T2D"
+  species = expdata$species[,samples_include]
+  pathways = expdata$pathways[,samples_include]
+  
+  # filter species and pathways by group
+  samples_healthy = rownames(sample_metadata)[sample_metadata$response=="healthy"]
+  samples_T2D = rownames(sample_metadata)[sample_metadata$response=="T2D"]
+  
+  # filter species
+  # incl_healthy = ((rowSums(species[,samples_healthy], na.rm = TRUE)/sum(species[,samples_healthy], na.rm = TRUE))*100) > filt_th
+  # incl_T2D = ((rowSums(species[,samples_T2D], na.rm = TRUE)/sum(species[,samples_T2D], na.rm = TRUE))*100) > filt_th
+  incl_healthy = ((rowSums(species[,samples_healthy] != 0, na.rm = TRUE) / ncol(species[,samples_healthy])) * 100) >= filt_th
+  incl_T2D = ((rowSums(species[,samples_T2D] != 0, na.rm = TRUE) / ncol(species[,samples_T2D])) * 100) >= filt_th
+  species = species[incl_healthy | incl_T2D,]
+  incl_var = apply(species, 1, var, na.rm=TRUE) > 0
+  species = species[incl_var,]
+  species_metadata = expdata$species_metadata[rownames(species),]
+  
+  # filter pathways
+  # incl_healthy = ((rowSums(pathways[,samples_healthy], na.rm = TRUE)/sum(pathways[,samples_healthy], na.rm = TRUE))*100) > filt_th
+  # incl_T2D = ((rowSums(pathways[,samples_T2D], na.rm = TRUE)/sum(pathways[,samples_T2D], na.rm = TRUE))*100) > filt_th
+  incl_healthy = ((rowSums(pathways[,samples_healthy] != 0, na.rm = TRUE) / ncol(pathways[,samples_healthy])) * 100) >= filt_th
+  incl_T2D = ((rowSums(pathways[,samples_T2D] != 0, na.rm = TRUE) / ncol(pathways[,samples_T2D])) * 100) >= filt_th
+  pathways = pathways[incl_healthy | incl_T2D,]
+  incl_var = apply(pathways, 1, var, na.rm=TRUE) > 0
+  pathways = pathways[incl_var,]
+  pathways_metadata = expdata$pathways_metadata[rownames(pathways),]
+  
+  # transform data with the clr transformation
+  species = as.matrix(t(clr(x = t(species) + 1)))
+  pathways = as.matrix(t(clr(x = t(pathways) + 1)))
+  
+  # return list
+  expdata = list(
+    species = species,
+    species_metadata = species_metadata,
+    pathways = pathways,
+    pathways_metadata = pathways_metadata,
+    sample_metadata = sample_metadata
+  )
+}
+)
+
+```
+
+
+### Merge studies
+
+identify features present in enough studies
+
+```{r}
+studies_obs_th <- length(all_expdata)
+# species
+species_incl = table(unlist(lapply(all_expdata, function(expdata){rownames(expdata$species)})))
+species_incl = names(species_incl)[species_incl>=studies_obs_th]
+
+# pathways
+pathways_incl = table(unlist(lapply(all_expdata, function(expdata){rownames(expdata$pathways)})))
+pathways_incl = names(pathways_incl)[pathways_incl>=studies_obs_th]
+```
+
+merge the data from all studies and only include features observed in enough studies
+
+```{r}
+# species
+species = lapply(all_expdata, function(expdata){
+  expdata.mat = expdata$species[is.element(rownames(expdata$species),species_incl),]
+  expdata.mat.pad = matrix(NA, 
+                           nrow = length(species_incl), ncol = ncol(expdata.mat),
+                           dimnames = list(species_incl, colnames(expdata.mat)))
+  
+  expdata.mat.pad[rownames(expdata.mat),] = expdata.mat
+  return(expdata.mat.pad)
+  })
+species = do.call(cbind,species)
+
+# species metadata
+species_metadata = lapply(all_expdata, function(expdata){
+  metadata = expdata$species_metadata[is.element(rownames(expdata$species_metadata),species_incl),]
+  metadata$species_id = rownames(metadata)
+  return(metadata)
+  })
+
+species_metadata = do.call(rbind,species_metadata)
+species_metadata = species_metadata[match(species_incl,species_metadata$species_id),]
+rownames(species_metadata) = species_metadata$species_id
+
+# pathways
+pathways = lapply(all_expdata, function(expdata){
+  expdata.mat = expdata$pathways[is.element(rownames(expdata$pathways),pathways_incl),]
+  expdata.mat.pad = matrix(NA, 
+                           nrow = length(pathways_incl), ncol = ncol(expdata.mat),
+                           dimnames = list(pathways_incl, colnames(expdata.mat)))
+  
+  expdata.mat.pad[rownames(expdata.mat),] = expdata.mat
+  return(expdata.mat.pad)
+  })
+pathways = do.call(cbind,pathways)
+
+# pathways metadata
+pathways_metadata = lapply(all_expdata, function(expdata){
+  metadata = expdata$pathways_metadata[is.element(rownames(expdata$pathways_metadata),pathways_incl),]
+  metadata$pathways_id = rownames(metadata)
+  return(metadata)
+  })
+
+pathways_metadata = do.call(rbind,pathways_metadata)
+pathways_metadata = pathways_metadata[match(pathways_incl,pathways_metadata$pathways_id),]
+rownames(pathways_metadata) = pathways_metadata$pathways_id
+
+# sample metadata
+sample_metadata = lapply(all_expdata, function(expdata){
+  metadata = expdata$sample_metadata[,c("study_name","subject_id","response")]
+  metadata$sample_id = rownames(metadata)
+  return(metadata)
+  })
+sample_metadata = do.call(rbind,sample_metadata)
+rownames(sample_metadata) = sample_metadata$sample_id
+
+```
+
+check the merged data
+
+```{r}
+# check names
+mean(rownames(sample_metadata) == colnames(pathways))
+mean(rownames(sample_metadata) == colnames(species))
+mean(rownames(species_metadata)==rownames(species))
+mean(rownames(pathways_metadata)==rownames(pathways))
+unique(sample_metadata$study_name)
+# check na values
+sum(rowMeans(is.na(species))==1)
+sum(colMeans(is.na(species))==1)
+sum(rowMeans(is.na(pathways))==1)
+sum(colMeans(is.na(pathways))==1)
+# check variances
+mean(apply(species, 1, var, na.rm=TRUE) > 0)
+mean(apply(species, 2, var, na.rm=TRUE) > 0)
+mean(apply(pathways, 1, var, na.rm=TRUE) > 0)
+mean(apply(pathways, 2, var, na.rm=TRUE) > 0)
+```
+
+filter out samples that have no variance
+
+```{r}
+species_var = colnames(species)[apply(species, 2, var, na.rm=TRUE) > 0]
+pathways_var = colnames(pathways)[apply(pathways, 2, var, na.rm=TRUE) > 0]
+var_incl = species_var[is.element(species_var,pathways_var)]
+sample_metadata = sample_metadata[var_incl,]
+species = species[,var_incl]
+pathways = pathways[,var_incl]
+# then rerun checks above
+```
+
+What are the dims?
+
+```{r}
+dim(species)
+dim(pathways)
+```
+
+Looks good - now save data for later
+
+# Save data
+
+```{r}
+all_expdata = list(
+  species = species,
+  species_metadata = species_metadata,
+  pathways = pathways,
+  pathways_metadata = pathways_metadata,
+  sample_metadata = sample_metadata
+)
+
+saveRDS(object = all_expdata, file = processed.data.path.CMD)
+```
+
