@@ -1,6 +1,6 @@
 # MINT Block evaluation
 
-MINT Block is an NP-integration framework for multi-omics data analysis, that deals with the unwanted variation arising from combining data from multiple studies. 
+MINT Block is an NP-integration framework for multi-omics data analysis, that deals with the unwanted variation arising from combining data from multiple studies. MINT Block is implemented in the **mixOmics** R package.
 
 <p align="center">
 <img src="images/MINTBlockSchema.png"> 
